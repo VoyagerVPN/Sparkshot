@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.24)
+project(Sparkshot VERSION 0.1.8 LANGUAGES CXX RC)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_executable(Sparkshot WIN32 src/main.cpp src/app.cpp src/app.hpp src/image.cpp src/image.hpp src/ui.cpp src/ui.hpp src/save.cpp src/save.hpp src/fill.cpp src/fill.hpp src/stroke.cpp src/stroke.hpp src/cursor.cpp src/cursor.hpp src/renderer.cpp src/renderer.hpp src/Sparkshot.rc)
+target_include_directories(Sparkshot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/assets)
+target_compile_definitions(Sparkshot PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(Sparkshot PRIVATE /W4 /utf-8 /EHsc)
+target_link_libraries(Sparkshot PRIVATE d3d11 dxgi d2d1 dwrite windowscodecs ole32 shell32 shlwapi comdlg32 comctl32 advapi32)
+target_link_options(Sparkshot PRIVATE /MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/src/Sparkshot.manifest)
+
+# Проверки используют тот же редактор, но скрытое окно без перехвата ввода и отдельный процесс Python.
+add_library(SparkshotTestHost SHARED EXCLUDE_FROM_ALL tests/test-host.cpp src/app.cpp src/image.cpp src/ui.cpp src/save.cpp src/fill.cpp src/stroke.cpp src/cursor.cpp src/renderer.cpp src/Sparkshot.rc)
+target_include_directories(SparkshotTestHost PRIVATE src assets)
+target_compile_definitions(SparkshotTestHost PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(SparkshotTestHost PRIVATE /W4 /utf-8 /EHsc)
+target_link_libraries(SparkshotTestHost PRIVATE d3d11 dxgi d2d1 dwrite windowscodecs ole32 shell32 shlwapi comdlg32 comctl32 advapi32)
