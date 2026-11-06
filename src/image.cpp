@@ -1,3 +1,4 @@
+#include "localization.hpp"
 #include "image.hpp"
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -7,7 +8,7 @@
 namespace sparkshot {
 using Microsoft::WRL::ComPtr;
 namespace {
-void Check(HRESULT result) { if (FAILED(result)) throw std::runtime_error("Ошибка Windows API при обработке изображения"); }
+void Check(HRESULT result) { if (FAILED(result)) throw LocalizedError(TextId::ErrorWindowsApiErrorWhileProcessingTheImage); }
 }
 Image CaptureDesktop() {
     Image image;
@@ -36,7 +37,7 @@ Image CaptureDesktop() {
     if (bitmap) DeleteObject(bitmap);
     DeleteDC(memory);
     ReleaseDC(nullptr, screen);
-    if (!ok) throw std::runtime_error("Не удалось захватить рабочий стол");
+    if (!ok) throw LocalizedError(TextId::ErrorCouldNotCaptureTheDesktop);
     return image;
 }
 Image DemoImage() {
@@ -67,7 +68,7 @@ std::vector<std::uint8_t> EncodePng(const Image& image) {
     Check(frame->SetSize(image.width, image.height));
     WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
     Check(frame->SetPixelFormat(&format));
-    if (format != GUID_WICPixelFormat32bppBGRA) throw std::runtime_error("Неожиданный формат PNG");
+    if (format != GUID_WICPixelFormat32bppBGRA) throw LocalizedError(TextId::ErrorUnexpectedPngFormat);
     Check(frame->WritePixels(image.height, image.width * 4, static_cast<UINT>(image.pixels.size() * 4), reinterpret_cast<BYTE*>(const_cast<std::uint32_t*>(image.pixels.data()))));
     Check(frame->Commit());
     Check(encoder->Commit());
@@ -78,7 +79,7 @@ std::vector<std::uint8_t> EncodePng(const Image& image) {
     Check(stream->Seek(zero, STREAM_SEEK_SET, nullptr));
     ULONG read{};
     Check(stream->Read(result.data(), static_cast<ULONG>(result.size()), &read));
-    if (read != result.size()) throw std::runtime_error("Не удалось прочитать PNG");
+    if (read != result.size()) throw LocalizedError(TextId::ErrorCouldNotReadThePng);
     return result;
 }
 void CopyImage(const Image& image, HWND owner) {
@@ -124,11 +125,11 @@ void CopyImage(const Image& image, HWND owner) {
         if (pngBlock) GlobalFree(pngBlock);
         if (v5Block) GlobalFree(v5Block);
         if (dibBlock) GlobalFree(dibBlock);
-        throw std::runtime_error("Недостаточно памяти для буфера обмена");
+        throw LocalizedError(TextId::ErrorNotEnoughMemoryForTheClipboard);
     }
     if (!OpenClipboard(owner)) {
         GlobalFree(pngBlock); GlobalFree(v5Block); GlobalFree(dibBlock);
-        throw std::runtime_error("Буфер обмена занят другим приложением");
+        throw LocalizedError(TextId::ErrorTheClipboardIsInUseByAnotherApplication);
     }
     EmptyClipboard();
     // Система забирает память успешно размещённых блоков; неудачные освобождаем сами.
@@ -139,6 +140,6 @@ void CopyImage(const Image& image, HWND owner) {
     if (!pngOk) GlobalFree(pngBlock);
     if (!v5Ok) GlobalFree(v5Block);
     if (!dibOk) GlobalFree(dibBlock);
-    if (!dibOk && !v5Ok && !pngOk) throw std::runtime_error("Не удалось скопировать изображение");
+    if (!dibOk && !v5Ok && !pngOk) throw LocalizedError(TextId::ErrorCouldNotCopyTheImage);
 }
 }

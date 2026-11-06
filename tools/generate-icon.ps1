@@ -17,17 +17,14 @@ foreach($taskSize in $taskSizes){
       $taskR=0.0;$taskG=0.0;$taskB=0.0;$taskA=0.0
       for($taskSy=0;$taskSy -lt 4;$taskSy++){for($taskSx=0;$taskSx -lt 4;$taskSx++){
         $taskPx=($taskX+($taskSx+0.5)/4)*64/$taskSize;$taskPy=($taskY+($taskSy+0.5)/4)*64/$taskSize
-        $taskQx=[math]::Max([math]::Abs($taskPx-32)-17,0);$taskQy=[math]::Max([math]::Abs($taskPy-32)-17,0)
-        if($taskQx*$taskQx+$taskQy*$taskQy -gt 169){continue}
+        $taskQx=[math]::Max([math]::Abs($taskPx-32)-18,0);$taskQy=[math]::Max([math]::Abs($taskPy-32)-18,0)
+        if($taskQx*$taskQx+$taskQy*$taskQy -gt 196){continue}
         $taskInside=$false
         for($taskI=0;$taskI -lt 6;$taskI++){
           $taskJ=($taskI+5)%6
           if((($taskPolyY[$taskI] -gt $taskPy) -ne ($taskPolyY[$taskJ] -gt $taskPy)) -and ($taskPx -lt ($taskPolyX[$taskJ]-$taskPolyX[$taskI])*($taskPy-$taskPolyY[$taskI])/($taskPolyY[$taskJ]-$taskPolyY[$taskI])+$taskPolyX[$taskI])){$taskInside=-not $taskInside}
         }
-        if($taskInside){$taskR+=255;$taskG+=255;$taskB+=255}else{
-          $taskT=($taskPx+$taskPy)/128
-          $taskR+=169+(115-169)*$taskT;$taskG+=131+(80-131)*$taskT;$taskB+=251+(222-251)*$taskT
-        }
+        if($taskInside){$taskR+=235;$taskG+=235;$taskB+=232}else{$taskR+=25;$taskG+=25;$taskB+=25}
         $taskA+=255
       }}
       $taskWriter.Write([byte]($taskB/16));$taskWriter.Write([byte]($taskG/16));$taskWriter.Write([byte]($taskR/16));$taskWriter.Write([byte]($taskA/16))

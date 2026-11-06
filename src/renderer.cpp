@@ -1,3 +1,4 @@
+#include "localization.hpp"
 #include "renderer.hpp"
 #include <stdexcept>
 #include <cstring>
@@ -5,7 +6,7 @@
 namespace sparkshot {
 using Microsoft::WRL::ComPtr;
 namespace {
-void Check(HRESULT result){if(FAILED(result))throw std::runtime_error("Не удалось подготовить аппаратную отрисовку Sparkshot");}
+void Check(HRESULT result){if(FAILED(result))throw LocalizedError(TextId::ErrorCouldNotInitializeSparkshotGraphics);}
 }
 Renderer::~Renderer(){Reset();}
 HRESULT Renderer::CreateDevice(ID2D1Factory1* factory,D3D_DRIVER_TYPE driver){
@@ -32,13 +33,13 @@ void Renderer::Create(ID2D1Factory1* factory,HWND window,UINT width,UINT height,
         desc.AlphaMode=DXGI_ALPHA_MODE_IGNORE;desc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
         ComPtr<IDXGISwapChain1> swap;Check(dxgiFactory->CreateSwapChainForHwnd(device_.Get(),window,&desc,nullptr,nullptr,&swap));Check(swap.As(&swap_));
         Check(dxgiFactory->MakeWindowAssociation(window,DXGI_MWA_NO_ALT_ENTER));Check(swap_->SetMaximumFrameLatency(1));
-        ready_=swap_->GetFrameLatencyWaitableObject();if(!ready_)throw std::runtime_error("Нет события готовности кадра DXGI");
+        ready_=swap_->GetFrameLatencyWaitableObject();if(!ready_)throw LocalizedError(TextId::ErrorTheDxgiFrameReadyEventIsUnavailable);
         ComPtr<IDXGISurface> surface;Check(swap_->GetBuffer(0,IID_PPV_ARGS(&surface)));
         const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET|D2D1_BITMAP_OPTIONS_CANNOT_DRAW,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_IGNORE),96,96);
         Check(canvas_->CreateBitmapFromDxgiSurface(surface.Get(),&props,&backBuffer_));
     }else{
         // Изолированные проверки не создают видимого окна и не вмешиваются в ввод пользователя.
-        ready_=CreateEventW(nullptr,FALSE,TRUE,nullptr);if(!ready_)throw std::runtime_error("Нет события для проверки отрисовки");
+        ready_=CreateEventW(nullptr,FALSE,TRUE,nullptr);if(!ready_)throw LocalizedError(TextId::ErrorTheRenderingTestEventIsUnavailable);
     }
     D3D11_TEXTURE2D_DESC desc{};desc.Width=width;desc.Height=height;desc.MipLevels=1;desc.ArraySize=1;desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc.Count=1;desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;Check(device_->CreateTexture2D(&desc,nullptr,&frameTexture_));
