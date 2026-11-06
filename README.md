@@ -4,40 +4,29 @@
 
 **English** · [Русский](README.ru.md)
 
-Capture a region of your screen, mark it up in the editor, and copy it to the clipboard or save it as a PNG.
-
-**Windows x64 · Portable EXE · C++20 / Win32**
+Portable screenshot and annotation tool for Windows x64.
 
 [Build Sparkshot](#build-from-source)
 
 ## Quick start
 
-1. Build and run `Sparkshot.exe`.
-2. Open Sparkshot from the Windows tray and start a capture. In Settings you can choose a capture shortcut, a save folder and the interface language.
-3. Drag to select the area. Annotate it, then use the editor controls to copy or save the image.
+1. Run `Sparkshot.exe` and start a capture from its icon in the Windows notification area.
+2. Drag to select an area. Use the editor toolbar to add annotations, then choose **Copy** or **Save**.
 
-Choose **English / Русский** in Settings. Sparkshot saves your choice in `data/settings.ini` beside the EXE. On first launch it uses Russian on Russian Windows and English on other systems. The system folder picker depends on Windows language resources.
+Set a capture shortcut or choose **English / Русский** in Settings.
 
 ## Features
 
-- Resize or move the capture region, then add arrows, lines, text, numbers, shapes or pixelation.
-- Pick colors from the screenshot with a magnified eyedropper. Undo with **Ctrl + Z** and redo with **Ctrl + Y** or **Ctrl + Shift + Z**.
-- Copy the result to the clipboard or save numbered PNG files without overwriting existing files.
-- Run from a portable EXE and optionally start with Windows.
+- Arrows, text, numbered markers and pixelation.
+- Color picker with a magnifier, plus undo and redo.
+- Numbered PNG files without overwriting earlier captures.
 
 ## Build from source
 
-Install Visual Studio 2026 Build Tools with MSVC x64, the Windows SDK, CMake and Ninja. The checked-in launcher expects the default Build Tools path.
+Install Visual Studio 2026 Build Tools in the default location with MSVC x64, Windows SDK, CMake and Ninja.
 
 ```cmd
 build.cmd
 ```
 
-Run `.cache/build/Sparkshot.exe`. No installer or separate Visual C++ Runtime is required for the built EXE.
-
-To check the localization resources, build the `SparkshotLocalizationTest` target:
-
-```cmd
-build.cmd build-l10n SparkshotLocalizationTest
-.cache\build-l10n\SparkshotLocalizationTest.exe
-```
+Run `.cache/build/Sparkshot.exe`.
