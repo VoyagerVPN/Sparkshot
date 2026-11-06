@@ -13,13 +13,15 @@ Portable screenshot and annotation tool for Windows x64.
 1. Run `Sparkshot.exe` and start a capture from its icon in the Windows notification area.
 2. Drag to select an area. Use the editor toolbar to add annotations, then choose **Copy** or **Save**.
 
-Set a capture shortcut or choose **English / Русский** in Settings.
+In Settings, choose the capture shortcut, PNG folder and interface language.
 
-## Features
+## Editor tools
 
-- Arrows, text, numbered markers and pixelation.
-- Color picker with a magnifier, plus undo and redo.
-- Numbered PNG files without overwriting earlier captures.
+- **Draw:** pencil, line, arrow, rectangle, ellipse and fill.
+- **Annotate:** text, numbered markers and pixelation.
+- **Refine:** eraser, magnified eyedropper, undo and redo.
+
+Move or resize the selection before saving. Use **Ctrl + Z** to undo and **Ctrl + Y** or **Ctrl + Shift + Z** to redo. Sparkshot numbers saved PNGs and keeps earlier captures.
 
 ## Build from source
 
