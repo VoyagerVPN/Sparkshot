@@ -18,7 +18,7 @@ public:
     void Reset();
     ID2D1RenderTarget* Target()const;
     HANDLE FrameReady()const;
-    HRESULT Present();
+    HRESULT Present(const RECT* dirty=nullptr);
     bool Hardware()const;
     std::vector<std::uint32_t> ReadPixels();
 private:
@@ -28,8 +28,8 @@ private:
     Microsoft::WRL::ComPtr<ID2D1Device> d2dDevice_;
     Microsoft::WRL::ComPtr<ID2D1DeviceContext> canvas_;
     Microsoft::WRL::ComPtr<IDXGISwapChain2> swap_;
-    Microsoft::WRL::ComPtr<ID2D1Bitmap1> backBuffer_,frame_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> frameTexture_;
+    Microsoft::WRL::ComPtr<ID2D1Bitmap1> frame_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer_,frameTexture_;
     HANDLE ready_{};
     UINT width_{},height_{};
     bool hardware_{};

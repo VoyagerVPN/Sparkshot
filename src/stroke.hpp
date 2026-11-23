@@ -11,13 +11,16 @@ public:
     const std::vector<std::uint32_t>& Pixels()const{return pixels_;}
     D2D1_RECT_U Bounds()const{return bounds_;}
     D2D1_RECT_U Dirty()const{return dirty_;}
+    D2D1_RECT_U Storage()const{return storage_;}
+    D2D1_POINT_2F Last()const{return last_;}
     void Uploaded(){dirty_={};}
 private:
     void Segment(D2D1_POINT_2F from,D2D1_POINT_2F to,float fromRadius,float toRadius);
+    void EnsureStorage(D2D1_RECT_U area);
     int width_{},height_{};
     D2D1_POINT_2F origin_{},last_{};
     float radius_{};
-    D2D1_RECT_U bounds_{},dirty_{};
+    D2D1_RECT_U bounds_{},dirty_{},storage_{};
     std::vector<std::uint32_t> pixels_;
 };
 }

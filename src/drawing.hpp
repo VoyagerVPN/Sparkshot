@@ -21,7 +21,6 @@ struct Annotation {
     unsigned color{0xff5757};
     float width{3};
     std::wstring text;
-    std::vector<float> widths;
     int pixelSize{12};
     std::shared_ptr<const FillData> fill;
     std::shared_ptr<const StrokeData> stroke;

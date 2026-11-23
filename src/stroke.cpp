@@ -11,10 +11,10 @@ D2D1_RECT_U Union(D2D1_RECT_U a,D2D1_RECT_U b){
 }
 void StrokeRaster::Begin(int width,int height,D2D1_POINT_2F origin,float radius){
     Reset();width_=width;height_=height;origin_=last_=origin;radius_=radius;
-    pixels_.assign(static_cast<size_t>(width)*height,0);Segment(origin,origin,radius,radius);
+    Segment(origin,origin,radius,radius);
 }
 void StrokeRaster::Add(D2D1_POINT_2F point,float radius){
-    if(pixels_.empty())return;
+    if(!width_||!height_)return;
     const float dx=point.x-last_.x,dy=point.y-last_.y;
     // Короткие участки ограничивают площадь обхода даже при резком движении по диагонали.
     const int count=std::max(1,static_cast<int>(std::ceil(std::hypot(dx,dy)/64)));
@@ -24,6 +24,30 @@ void StrokeRaster::Add(D2D1_POINT_2F point,float radius){
         Segment(previous,next,previousRadius,nextRadius);previous=next;previousRadius=nextRadius;
     }
     last_=point;radius_=radius;
+}
+void StrokeRaster::EnsureStorage(D2D1_RECT_U area){
+    if(!Empty(storage_)&&area.left>=storage_.left&&area.top>=storage_.top&&
+        area.right<=storage_.right&&area.bottom<=storage_.bottom)return;
+    auto next=Union(storage_,area);
+    // Удваиваем только ту сторону маски, до которой дошла кисть.
+    const auto grow=[](UINT32& start,UINT32& end,UINT32 oldStart,UINT32 oldEnd,UINT32 limit){
+        const UINT32 oldSize=oldEnd-oldStart;
+        if(oldSize&&start==oldStart&&end==oldEnd)return;
+        const UINT32 size=std::min(limit,std::max({64u,end-start,oldSize*2}));
+        const UINT32 extra=size-(end-start);
+        const UINT32 before=oldSize?(start<oldStart?extra:0):extra/2;
+        start=std::min(start-std::min(start,before),limit-size);
+        end=start+size;
+    };
+    grow(next.left,next.right,storage_.left,storage_.right,width_);
+    grow(next.top,next.bottom,storage_.top,storage_.bottom,height_);
+    const auto stride=next.right-next.left,oldStride=storage_.right-storage_.left;
+    std::vector<std::uint32_t> pixels(static_cast<size_t>(stride)*(next.bottom-next.top));
+    for(UINT32 y=storage_.top;y<storage_.bottom;++y){
+        std::copy_n(pixels_.data()+static_cast<size_t>(y-storage_.top)*oldStride,oldStride,
+            pixels.data()+static_cast<size_t>(y-next.top)*stride+(storage_.left-next.left));
+    }
+    storage_=next;pixels_.swap(pixels);
 }
 void StrokeRaster::Segment(D2D1_POINT_2F from,D2D1_POINT_2F to,float fromRadius,float toRadius){
     const float dx=to.x-from.x,dy=to.y-from.y,length=std::hypot(dx,dy);
@@ -38,12 +62,13 @@ void StrokeRaster::Segment(D2D1_POINT_2F from,D2D1_POINT_2F to,float fromRadius,
         static_cast<UINT32>(std::clamp(static_cast<int>(std::ceil(std::max(from.x,to.x)+radius)),0,width_)),
         static_cast<UINT32>(std::clamp(static_cast<int>(std::ceil(std::max(from.y,to.y)+radius)),0,height_)));
     if(Empty(rect))return;
+    EnsureStorage(rect);
     const float segmentLength=std::hypot(to.x-from.x,to.y-from.y);
     const float ux=segmentLength>.001f?(to.x-from.x)/segmentLength:0,uy=segmentLength>.001f?(to.y-from.y)/segmentLength:0;
     const float slope=segmentLength>.001f?(toRadius-fromRadius)/segmentLength:0;
     const float correction=slope/std::sqrt(std::max(.000001f,1-slope*slope));
     for(UINT32 y=rect.top;y<rect.bottom;++y)for(UINT32 x=rect.left;x<rect.right;++x){
-        auto& pixel=pixels_[static_cast<size_t>(y)*width_+x];if(pixel==0xffffffff)continue;
+        auto& pixel=pixels_[static_cast<size_t>(y-storage_.top)*(storage_.right-storage_.left)+x-storage_.left];if(pixel==0xffffffff)continue;
         const float px=x+.5f-from.x,py=y+.5f-from.y;
         const float along=px*ux+py*uy,across=std::abs(px*uy-py*ux);
         // Ближайшая точка огибающей кругов с линейно меняющимся радиусом.
@@ -60,8 +85,8 @@ std::shared_ptr<const StrokeData> StrokeRaster::Finish()const{
     auto result=std::make_shared<StrokeData>();result->width=static_cast<int>(bounds_.right-bounds_.left);result->height=static_cast<int>(bounds_.bottom-bounds_.top);
     result->offsetX=bounds_.left-origin_.x;result->offsetY=bounds_.top-origin_.y;
     result->pixels.resize(static_cast<size_t>(result->width)*result->height);
-    for(int y=0;y<result->height;++y)std::copy_n(pixels_.data()+static_cast<size_t>(bounds_.top+y)*width_+bounds_.left,result->width,result->pixels.data()+static_cast<size_t>(y)*result->width);
+    for(int y=0;y<result->height;++y)std::copy_n(pixels_.data()+static_cast<size_t>(bounds_.top-storage_.top+y)*(storage_.right-storage_.left)+(bounds_.left-storage_.left),result->width,result->pixels.data()+static_cast<size_t>(y)*result->width);
     return result;
 }
-void StrokeRaster::Reset(){width_=height_=0;bounds_=dirty_={};std::vector<std::uint32_t>().swap(pixels_);}
+void StrokeRaster::Reset(){width_=height_=0;storage_=bounds_=dirty_={};std::vector<std::uint32_t>().swap(pixels_);}
 }

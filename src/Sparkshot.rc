@@ -1,8 +1,8 @@
 #include <windows.h>
 101 ICON "Sparkshot.ico"
 1 VERSIONINFO
- FILEVERSION 0,1,8,0
- PRODUCTVERSION 0,1,8,0
+ FILEVERSION 0,1,9,0
+ PRODUCTVERSION 0,1,9,0
  FILEFLAGSMASK 0x3fL
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
@@ -11,10 +11,10 @@ BEGIN
  BEGIN
   BLOCK "040904b0"
   BEGIN
-   VALUE "FileDescription", "Sparkshot portable prototype"
-   VALUE "FileVersion", "0.1.8"
+   VALUE "FileDescription", "Sparkshot screenshot tool"
+   VALUE "FileVersion", "0.1.9"
    VALUE "ProductName", "Sparkshot"
-   VALUE "ProductVersion", "0.1.8"
+   VALUE "ProductVersion", "0.1.9"
    VALUE "OriginalFilename", "Sparkshot.exe"
   END
  END
@@ -24,3 +24,4 @@ BEGIN
  END
 END
 #include "localization-strings.rc"
+#include "settings.rc"

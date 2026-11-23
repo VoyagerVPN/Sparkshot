@@ -1,4 +1,6 @@
 #include "app.hpp"
+#include "settings_view.hpp"
+#include "settings_ids.h"
 #include "drawing.hpp"
 #include "image.hpp"
 #include "ui.hpp"
@@ -34,6 +36,26 @@ bool Inside(D2D1_RECT_F r,D2D1_POINT_2F p) {return p.x>=r.left&&p.x<=r.right&&p.
 float Distance(D2D1_POINT_2F a,D2D1_POINT_2F b) {return std::hypot(a.x-b.x,a.y-b.y);}
 bool IsBrush(Tool tool){return tool==Tool::Pen||tool==Tool::Eraser;}
 float BrushRadius(float width){return width*.5f;}
+// Сериализуем поиск и создание окна. После публикации окна мьютекс больше не нужен.
+class StartupGate {
+public:
+    bool Lock(){
+        mutex_=CreateMutexW(nullptr,FALSE,L"Local\\Sparkshot.Native.Startup");
+        if(!mutex_)return false;
+        const DWORD result=WaitForSingleObject(mutex_,INFINITE);
+        owned_=result==WAIT_OBJECT_0||result==WAIT_ABANDONED;
+        return owned_;
+    }
+    void Close(){
+        if(owned_)ReleaseMutex(mutex_);
+        if(mutex_)CloseHandle(mutex_);
+        owned_=false;mutex_=nullptr;
+    }
+    ~StartupGate(){Close();}
+private:
+    HANDLE mutex_{};
+    bool owned_{};
+};
 }
 struct App::Impl {
     HINSTANCE instance{}; HWND window{},edit{},hexEdit{};
@@ -48,14 +70,14 @@ struct App::Impl {
     const wchar_t* ToolName(int index)const{return Text(ToolNames[index]);}
     std::filesystem::path base,folder,executable;
     std::wstring startupCommand;
-    bool settings{},startupHere{};
-    enum class ReturnView {None,Settings,Tray} captureReturn{ReturnView::None};
-    RECT captureReturnBounds{};
-    std::wstring captureReturnStatus;
+    HWND settingsWindow{};
+    SettingsView settingsView;
+    std::wstring settingsStatus;
+    bool startupHere{},restoreSettings{},folderDialogOpen{};
     UINT captureKey{'S'},captureModifiers{MOD_CONTROL|MOD_ALT};
-    bool choosingHotkey{};
+    bool choosingHotkey{},menuTracking{},captureAfterMenu{};
     Image image;
-    bool demo{},headless{},active{},selected{},dragging{},picker{},palette{},changingHex{},trayMenu{},hotkeyAvailable{true},selectedBefore{},annotationsDirty{true};
+    bool demo{},headless{},active{},selected{},dragging{},picker{},palette{},changingHex{},hotkeyAvailable{true},selectedBefore{},annotationsDirty{true};
     D2D1_RECT_F paletteBounds{};
     float hue{},saturation{},value{};
     float brightnessHue{-1},brightnessSaturation{-1},textSize{24};
@@ -87,7 +109,6 @@ struct App::Impl {
     ComPtr<ID2D1Factory1> factory;
     ComPtr<IDWriteFactory> textFactory;
     ComPtr<IDWriteTextFormat> font,smallFont;
-    ComPtr<IDWriteTextFormat> settingsTitleFont,settingsSectionFont;
     Renderer renderer;
     ComPtr<ID2D1RenderTarget> target;
     ComPtr<ID2D1BitmapRenderTarget> sceneTarget;
@@ -95,6 +116,7 @@ struct App::Impl {
     bool framePending{},sceneDirty{true},frameSlotReady{},retryPresent{},captureShowPending{};
     unsigned demoGeneration{};
     RECT previousOverlay{};
+    RECT previousFrameBounds{};
     ComPtr<ID2D1Bitmap> background;
     ComPtr<ID2D1BitmapRenderTarget> annotationTarget;
     ComPtr<ID2D1Bitmap> annotationBitmap;
@@ -107,11 +129,20 @@ struct App::Impl {
     }
     void DropRenderResources(bool resetDevice=false){
         colorFieldBitmap.Reset();brightnessBitmap.Reset();liveStrokeBitmap.Reset();background.Reset();annotationBitmap.Reset();annotationTarget.Reset();annotationSource.Reset();
-        sceneBitmap.Reset();sceneTarget.Reset();brush.Reset();target.Reset();if(resetDevice)renderer.Reset();else renderer.ReleaseFrame();annotationsDirty=true;sceneDirty=true;frameSlotReady=false;retryPresent=false;previousOverlay={};
+        sceneBitmap.Reset();sceneTarget.Reset();brush.Reset();target.Reset();if(resetDevice)renderer.Reset();else renderer.ReleaseFrame();annotationsDirty=true;sceneDirty=true;frameSlotReady=false;retryPresent=false;previousOverlay={};previousFrameBounds={};
+    }
+    std::wstring ErrorText(const std::exception& error) const {
+        if(const auto* localizedError=dynamic_cast<const LocalizedError*>(&error))
+            return std::wstring(Text(localizedError->Id()))+localizedError->Detail();
+        const char* description=error.what();
+        const int length=MultiByteToWideChar(CP_UTF8,0,description,-1,nullptr,0);
+        std::wstring text(length,L'\0');
+        if(length){MultiByteToWideChar(CP_UTF8,0,description,-1,text.data(),length);text.pop_back();}
+        return std::wstring(Text(TextId::UnexpectedError))+L": "+text;
     }
     void Error(const std::exception& error) {
-        if(const auto* localizedError=dynamic_cast<const LocalizedError*>(&error))status=std::wstring(Text(localizedError->Id()))+localizedError->Detail();
-        else{const std::string description=error.what();const int length=MultiByteToWideChar(CP_UTF8,0,description.c_str(),-1,nullptr,0);std::wstring text(static_cast<size_t>(length),0);MultiByteToWideChar(CP_UTF8,0,description.c_str(),-1,text.data(),length);if(!text.empty()&&text.back()==0)text.pop_back();status=std::wstring(Text(TextId::UnexpectedError))+L": "+text;}
+        if(IsWindowVisible(settingsWindow)){SettingsError(error);return;}
+        status=ErrorText(error);
         if(headless)SetWindowTextW(window,status.c_str());
         RequestFrame();
     }
@@ -151,7 +182,7 @@ struct App::Impl {
         if(opened!=ERROR_SUCCESS)throw LocalizedError(TextId::ErrorCouldNotOpenWindowsStartupSettings);
         const auto result=enabled?RegSetValueExW(key,L"Sparkshot",0,REG_SZ,reinterpret_cast<const BYTE*>(line.c_str()),static_cast<DWORD>((line.size()+1)*sizeof(wchar_t))):RegDeleteValueW(key,L"Sparkshot");RegCloseKey(key);
         if(result!=ERROR_SUCCESS&&!(result==ERROR_FILE_NOT_FOUND&&!enabled))throw LocalizedError(TextId::ErrorCouldNotChangeWindowsStartupSettings);
-        ReadStartup();status=enabled?Text(TextId::StartupEnabledForThisCopyOfSparkshot):Text(TextId::StartupDisabled);RequestFrame();
+        ReadStartup();settingsStatus=enabled?Text(TextId::StartupEnabledForThisCopyOfSparkshot):Text(TextId::StartupDisabled);RefreshSettings();
     }
     std::wstring HotkeyName()const{
         std::wstring name;if(captureModifiers&MOD_CONTROL)name+=L"Ctrl+";if(captureModifiers&MOD_ALT)name+=L"Alt+";if(captureModifiers&MOD_SHIFT)name+=L"Shift+";if(captureModifiers&MOD_WIN)name+=L"Win+";
@@ -165,7 +196,7 @@ struct App::Impl {
         const bool wasRegistered=hotkeyAvailable;if(wasRegistered)UnregisterHotKey(window,1);
         if(!RegisterHotKey(window,1,modifiers|MOD_NOREPEAT,key)){
             hotkeyAvailable=wasRegistered&&RegisterHotKey(window,1,captureModifiers|MOD_NOREPEAT,captureKey)!=FALSE;
-            status=Text(TextId::WindowsRejectedThisShortcutItMayBeInUseOrReserve);RequestFrame();return;
+            settingsStatus=Text(TextId::WindowsRejectedThisShortcutItMayBeInUseOrReserve);RefreshSettings();return;
         }
         // Обе части сочетания записываются одним обновлением секции INI.
         try{
@@ -175,28 +206,34 @@ struct App::Impl {
             updated+=L"CaptureKey="+std::to_wstring(key);updated.push_back(0);updated+=L"CaptureModifiers="+std::to_wstring(modifiers);updated.push_back(0);updated.push_back(0);
             if(!WritePrivateProfileSectionW(L"Sparkshot",updated.c_str(),ini.c_str()))throw LocalizedError(TextId::ErrorCouldNotSaveTheShortcutNextToTheExe);
         }catch(...){UnregisterHotKey(window,1);hotkeyAvailable=wasRegistered&&RegisterHotKey(window,1,captureModifiers|MOD_NOREPEAT,captureKey)!=FALSE;throw;}
-        captureKey=key;captureModifiers=modifiers;hotkeyAvailable=true;status=FormatLocalized(Text(TextId::CaptureShortcutSaved),HotkeyName());UpdateTrayTip();RequestFrame();
+        captureKey=key;captureModifiers=modifiers;hotkeyAvailable=true;settingsStatus=FormatLocalized(Text(TextId::CaptureShortcutSaved),HotkeyName());UpdateTrayTip();RefreshSettings();
     }
     void HotkeyInput(WPARAM key){
-        if(key==VK_ESCAPE){choosingHotkey=false;status.clear();RequestFrame();return;}
+        if(key==VK_ESCAPE){choosingHotkey=false;settingsStatus.clear();RefreshSettings();return;}
         if(key==VK_CONTROL||key==VK_LCONTROL||key==VK_RCONTROL||key==VK_MENU||key==VK_LMENU||key==VK_RMENU||key==VK_SHIFT||key==VK_LSHIFT||key==VK_RSHIFT||key==VK_LWIN||key==VK_RWIN)return;
         UINT modifiers=0;if(GetKeyState(VK_CONTROL)&0x8000)modifiers|=MOD_CONTROL;if(GetKeyState(VK_MENU)&0x8000)modifiers|=MOD_ALT;if(GetKeyState(VK_SHIFT)&0x8000)modifiers|=MOD_SHIFT;if((GetKeyState(VK_LWIN)|GetKeyState(VK_RWIN))&0x8000)modifiers|=MOD_WIN;
         choosingHotkey=false;SetHotkey(static_cast<UINT>(key),modifiers);
     }
-    void ChooseFolder() {
+    void ChooseFolder(HWND owner) {
+        if(folderDialogOpen)return;
         ULONG count{};const wchar_t* preferred=language==Language::Russian?L"ru-RU\0":L"en-US\0";
         SetThreadPreferredUILanguages(MUI_LANGUAGE_NAME,preferred,&count);
         ComPtr<IFileDialog> dialog;
         if(FAILED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog))))return;
         DWORD options{};dialog->GetOptions(&options);dialog->SetOptions(options|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM);dialog->SetTitle(Text(TextId::FolderForScreenshotNumberPng));
         ComPtr<IShellItem> current;if(SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(),nullptr,IID_PPV_ARGS(&current))))dialog->SetFolder(current.Get());
-        if(SUCCEEDED(dialog->Show(window))) {
+        folderDialogOpen=true;
+        const HRESULT choice=dialog->Show(owner);
+        folderDialogOpen=false;
+        if(SUCCEEDED(choice)) {
             ComPtr<IShellItem> result;dialog->GetResult(&result);PWSTR path{};
-            if(SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH,&path))) {
-                folder=path;CoTaskMemFree(path);std::filesystem::create_directories(base/L"data");
-                const auto relative=folder.lexically_relative(base);
-                const auto stored=!relative.empty()&&*relative.begin()!=L".."?relative:folder;
+            if(result&&SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH,&path))) {
+                std::filesystem::path chosen(path);CoTaskMemFree(path);std::filesystem::create_directories(base/L"data");
+                const auto relative=chosen.lexically_relative(base);
+                const auto stored=!relative.empty()&&*relative.begin()!=L".."?relative:chosen;
                 if(!WritePrivateProfileStringW(L"Sparkshot",L"SaveFolder",stored.c_str(),(base/L"data"/L"settings.ini").c_str()))throw LocalizedError(TextId::ErrorCouldNotSaveSettingsNextToTheExe);
+                folder=std::move(chosen);
+                if(owner==settingsWindow)settingsStatus=FormatLocalized(Text(TextId::SaveFolder),folder.wstring());
             }
         }
         RequestFrame();
@@ -204,13 +241,14 @@ struct App::Impl {
     void Hide() {
         ClosePalette();
         CancelText();colorFieldBitmap.Reset();brightnessBitmap.Reset();
-        active=false;captureShowPending=false;trayMenu=false;settings=false;captureReturn=ReturnView::None;captureReturnStatus.clear();choosingHotkey=false;dragging=false;picker=false;snapShapes=false;guides=false;mode=Mode::None;ReleaseCapture();ShowWindow(window,SW_HIDE);
+        active=false;hover=-1;mouseInside=false;wheelRemainder=0;captureShowPending=false;dragging=false;picker=false;snapShapes=false;guides=false;mode=Mode::None;ReleaseCapture();ShowWindow(window,SW_HIDE);
         liveStroke.Reset();liveStrokeBitmap.Reset();preview={};originalObject={};
         DropRenderResources();framePending=false;image={};annotations.clear();undoStack.clear();redoStack.clear();annotationsDirty=true;
     }
-    void Capture() {
-        const auto returnView=settings?ReturnView::Settings:trayMenu?ReturnView::Tray:captureReturn;auto returnBounds=captureReturnBounds;const auto returnStatus=settings||trayMenu?status:captureReturnStatus;
-        if(settings||trayMenu)GetWindowRect(window,&returnBounds);
+    void Capture(bool fromTray=false) {
+        if(folderDialogOpen)return;
+        if(menuTracking){captureAfterMenu=true;EndMenu();return;}
+        const bool returning=!fromTray&&(IsWindowVisible(settingsWindow)||restoreSettings);
         // Сначала снимаем видимые окна, включая собственные; только затем освобождаем редактор.
         if(active)RedrawWindow(window,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);
         // BitBlt считывает рабочий стол; дополнительное ожидание DWM задерживало захват при нагрузке на GPU.
@@ -221,7 +259,8 @@ struct App::Impl {
             for(int y=0;y<height;++y)for(int x=0;x<width;++x){const auto pixel=captured.pixels[static_cast<size_t>(y)*captured.width+x];pixels[static_cast<size_t>(y)*width+x]=(pixel&0xff00ff00)|((pixel&0xff)<<16)|((pixel>>16)&0xff);}
             captured.width=width;captured.height=height;captured.pixels=std::move(pixels);
         }
-        Hide();image=std::move(captured);captureReturn=returnView;captureReturnBounds=returnBounds;captureReturnStatus=returnStatus;
+        if(settingsWindow)ShowWindow(settingsWindow,SW_HIDE);
+        Hide();image=std::move(captured);restoreSettings=returning;
         selected=false;selection={};annotations.clear();undoStack.clear();redoStack.clear();mode=Mode::None;status.clear();SelectTool(Tool::Select);
         if(headless){
             SetWindowPos(window,nullptr,0,0,image.width,image.height,SWP_NOACTIVATE|SWP_NOZORDER);
@@ -239,10 +278,8 @@ struct App::Impl {
         if(frameSlotReady)PaintFrame();
     }
     void FinishCapture(){
-        const auto returnView=captureReturn;const auto bounds=captureReturnBounds;const auto previousStatus=captureReturnStatus;Hide();
-        if(returnView==ReturnView::None)return;
-        if(returnView==ReturnView::Settings)ShowSettings();else ShowTrayMenu();
-        SetWindowPos(window,nullptr,bounds.left,bounds.top,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);status=previousStatus;RefreshCursor(true);RequestFrame();
+        Hide();
+        if(restoreSettings){restoreSettings=false;ShowSettings();}
     }
     void Resources() {
         if(target)return;
@@ -267,14 +304,37 @@ struct App::Impl {
     }
     void Button(D2D1_RECT_F r,bool on=false,bool enabled=true){
         if(on){SetColor(brush.Get(),0xdcdcd5);target->FillRoundedRectangle(D2D1::RoundedRect(r,3,3),brush.Get());}
-        else if(enabled&&Inside(r,mouse)){SetColor(brush.Get(),0x333333);target->FillRoundedRectangle(D2D1::RoundedRect(r,6,6),brush.Get());}
+        else if(enabled&&mouseInside&&Inside(r,mouse)){SetColor(brush.Get(),0x333333);target->FillRoundedRectangle(D2D1::RoundedRect(r,6,6),brush.Get());}
     }
     bool ToolsVisible()const{return selected&&mode!=Mode::Creating;}
     float ToolStep()const{return std::clamp((image.height-128.0f)/ToolCount,22.0f,32.0f);}
     D2D1_RECT_F ToolButton(int index)const{const auto r=Tools();const float y=r.top+6+index*ToolStep();return D2D1::RectF(r.left+6,y,r.right-6,y+ToolStep()-2);}
     D2D1_RECT_F UndoButton(bool redo)const{const auto r=Tools();const float y=r.top+ToolCount*ToolStep()+14+(redo?30.0f:0.0f);return D2D1::RectF(r.left+6,y,r.right-6,y+28);}
     D2D1_RECT_F ColorButton()const{const auto r=Tools();return D2D1::RectF(r.left+6,r.bottom-36,r.right-6,r.bottom-6);}
-    int HoverAt(D2D1_POINT_2F p)const{if(!ToolsVisible()||dragging||palette)return -1;for(int i=0;i<ToolCount;++i)if(Inside(ToolButton(i),p))return i;if(Inside(UndoButton(false),p))return ToolCount;if(Inside(UndoButton(true),p))return ToolCount+1;if(Inside(ColorButton(),p))return ToolCount+2;return -1;}
+    std::array<D2D1_RECT_F,4> ActionButtons()const{
+        const auto actions=Actions();
+        return {D2D1::RectF(actions.left+5,actions.top+5,actions.left+140,actions.bottom-5),D2D1::RectF(actions.left+142,actions.top+5,actions.left+278,actions.bottom-5),D2D1::RectF(actions.left+280,actions.top+5,actions.left+380,actions.bottom-5),D2D1::RectF(actions.left+385,actions.top+5,actions.right-5,actions.bottom-5)};
+    }
+    int ActionAt(D2D1_POINT_2F point)const{
+        const auto buttons=ActionButtons();
+        for(int i=0;i<4;++i)if(Inside(buttons[i],point))return i;
+        return -1;
+    }
+    int HoverAt(D2D1_POINT_2F point)const{
+        if(dragging||palette)return -1;
+        if(Inside(CloseButton(),point))return ToolCount+7;
+        if(!ToolsVisible())return -1;
+        if(Inside(Actions(),point)){
+            const int action=ActionAt(point);
+            return action<0?-1:ToolCount+3+action;
+        }
+        if(!Inside(Tools(),point))return -1;
+        for(int i=0;i<ToolCount;++i)if(Inside(ToolButton(i),point))return i;
+        if(Inside(UndoButton(false),point))return ToolCount;
+        if(Inside(UndoButton(true),point))return ToolCount+1;
+        if(Inside(ColorButton(),point))return ToolCount+2;
+        return -1;
+    }
     void PaintTools(){
         const auto panel=Tools(),actions=Actions();Panel(panel);Panel(actions);
         for(int i=0;i<ToolCount;++i){const auto r=ToolButton(i);Button(r,static_cast<int>(tool)==i);Icon(static_cast<ui::Icon>(i),D2D1::RectF(r.left+7,r.top+7,r.right-7,r.bottom-7),static_cast<int>(tool)==i?0x1c1c1c:0xebebe8);}
@@ -282,11 +342,11 @@ struct App::Impl {
         for(bool redo:{false,true}){auto r=UndoButton(redo);const bool enabled=redo?!redoStack.empty():!undoStack.empty();Button(r,false,enabled);Icon(redo?ui::Icon::Redo:ui::Icon::Undo,D2D1::RectF(r.left+8,r.top+4,r.right-8,r.bottom-4),enabled?0xebebe8:0x666666);}
         const auto colors=ColorButton();Button(colors,palette);const auto center=D2D1::Point2F((colors.left+colors.right)/2,(colors.top+colors.bottom)/2);
         SetColor(brush.Get(),color);target->FillEllipse(D2D1::Ellipse(center,9,9),brush.Get());SetColor(brush.Get(),0xacaca8);target->DrawEllipse(D2D1::Ellipse(center,9,9),brush.Get(),1);
-        const std::array<D2D1_RECT_F,4> buttons{D2D1::RectF(actions.left+5,actions.top+5,actions.left+140,actions.bottom-5),D2D1::RectF(actions.left+142,actions.top+5,actions.left+278,actions.bottom-5),D2D1::RectF(actions.left+280,actions.top+5,actions.left+380,actions.bottom-5),D2D1::RectF(actions.left+385,actions.top+5,actions.right-5,actions.bottom-5)};
+        const auto buttons=ActionButtons();
         for(const auto r:buttons)Button(r);
         for(int i=0;i<3;++i){auto r=buttons[i];Icon(i==0?ui::Icon::Copy:i==1?ui::Icon::Save:ui::Icon::Folder,D2D1::RectF(r.left+8,r.top+7,r.left+28,r.bottom-7));Label(i==0?Text(TextId::Copy):i==1?Text(TextId::Save):Text(TextId::Folder),D2D1::RectF(r.left+37,r.top+7,r.right,r.bottom),0xebebe8,true);}
         const auto close=buttons[3];Icon(ui::Icon::Close,D2D1::RectF(close.left+7,close.top+7,close.right-7,close.bottom-7));
-        if(hover>=0){const auto hint=hover<ToolCount?ToolName(hover):hover==ToolCount?Text(TextId::UndoCtrlZ):hover==ToolCount+1?Text(TextId::RedoCtrlY):Text(TextId::Color);const float x=std::clamp(panel.left-205,8.0f,std::max(8.0f,image.width-215.0f)),y=std::clamp(mouse.y-18,8.0f,std::max(8.0f,image.height-42.0f));Panel(D2D1::RectF(x,y,x+198,y+34));Label(hint,D2D1::RectF(x+10,y+8,x+190,y+32),0xebebe8,true);}
+        if(hover>=0&&hover<=ToolCount+2){const auto hint=hover<ToolCount?ToolName(hover):hover==ToolCount?Text(TextId::UndoCtrlZ):hover==ToolCount+1?Text(TextId::RedoCtrlY):Text(TextId::Color);const float x=std::clamp(panel.left-205,8.0f,std::max(8.0f,image.width-215.0f)),y=std::clamp(mouse.y-18,8.0f,std::max(8.0f,image.height-42.0f));Panel(D2D1::RectF(x,y,x+198,y+34));Label(hint,D2D1::RectF(x+10,y+8,x+190,y+32),0xebebe8,true);}
     }
     D2D1_RECT_F ColorField()const{return D2D1::RectF(paletteBounds.left+12,paletteBounds.top+54,paletteBounds.left+170,paletteBounds.top+202);}
     D2D1_RECT_F BrightnessBar()const{return D2D1::RectF(paletteBounds.left+186,paletteBounds.top+54,paletteBounds.left+202,paletteBounds.top+202);}
@@ -363,8 +423,15 @@ struct App::Impl {
         return D2D1::RectF(x,y,x+48,y+height);
     }
     D2D1_RECT_F Actions()const{
-        const float x=std::clamp(selection.left,10.0f,std::max(10.0f,image.width-434.0f));float y=selection.bottom+12;
+        float x=std::clamp(selection.left,10.0f,std::max(10.0f,image.width-434.0f));float y=selection.bottom+12;
         if(y+46>image.height-8)y=std::max(8.0f,selection.top-58);
+        const auto tools=Tools();
+        if(y<tools.bottom+8&&y+44>tools.top-8&&x<tools.right+8&&x+424>tools.left-8){
+            if(tools.left>=442)x=tools.left-8-424;
+            else if(tools.right+8+424<=image.width-10)x=tools.right+8;
+            else if(tools.bottom+8+44<=image.height-8)y=tools.bottom+8;
+            else if(tools.top>=60)y=tools.top-8-44;
+        }
         return D2D1::RectF(x,y,x+424,y+44);
     }
     void SelectTool(Tool next){toolWidths[static_cast<size_t>(tool)]=thickness;tool=next;thickness=toolWidths[static_cast<size_t>(tool)];snapShapes=(GetKeyState(VK_SHIFT)&0x8000)!=0;}
@@ -380,14 +447,26 @@ struct App::Impl {
     void UploadLiveStroke(){
         if(mode!=Mode::Drawing||!IsBrush(preview.tool)||liveStroke.Pixels().empty())return;
         HRESULT hr=S_OK;
-        if(!liveStrokeBitmap)hr=target->CreateBitmap(D2D1::SizeU(image.width,image.height),liveStroke.Pixels().data(),image.width*4,D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96),&liveStrokeBitmap);
-        else {const auto dirty=liveStroke.Dirty();if(dirty.left<dirty.right&&dirty.top<dirty.bottom)hr=liveStrokeBitmap->CopyFromMemory(&dirty,liveStroke.Pixels().data()+static_cast<size_t>(dirty.top)*image.width+dirty.left,image.width*4);}
+        const auto storage=liveStroke.Storage();
+        const auto size=D2D1::SizeU(storage.right-storage.left,storage.bottom-storage.top);
+        if(!liveStrokeBitmap||liveStrokeBitmap->GetPixelSize().width!=size.width||liveStrokeBitmap->GetPixelSize().height!=size.height){
+            liveStrokeBitmap.Reset();
+            hr=target->CreateBitmap(size,liveStroke.Pixels().data(),size.width*4,D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96),&liveStrokeBitmap);
+        }else{
+            const auto dirty=liveStroke.Dirty();
+            if(dirty.left<dirty.right&&dirty.top<dirty.bottom){
+                const auto local=D2D1::RectU(dirty.left-storage.left,dirty.top-storage.top,dirty.right-storage.left,dirty.bottom-storage.top);
+                hr=liveStrokeBitmap->CopyFromMemory(&local,liveStroke.Pixels().data()+static_cast<size_t>(local.top)*size.width+local.left,size.width*4);
+            }
+        }
         if(FAILED(hr))throw LocalizedError(TextId::ErrorCouldNotUpdateTheBrushMask);liveStroke.Uploaded();
     }
     void DrawLiveStroke(){
         const auto bounds=liveStroke.Bounds();const auto area=D2D1::RectF(static_cast<float>(bounds.left),static_cast<float>(bounds.top),static_cast<float>(bounds.right),static_cast<float>(bounds.bottom));
         SetColor(brush.Get(),preview.color);
-        DrawStrokeMask(target.Get(),brush.Get(),preview.tool,liveStrokeBitmap.Get(),area,area,background.Get());
+        const auto storage=liveStroke.Storage();
+        const auto local=D2D1::RectF(area.left-storage.left,area.top-storage.top,area.right-storage.left,area.bottom-storage.top);
+        DrawStrokeMask(target.Get(),brush.Get(),preview.tool,liveStrokeBitmap.Get(),area,local,background.Get());
     }
     void DrawAnnotation(ID2D1RenderTarget* canvas,ID2D1SolidColorBrush* paint,const Annotation& a,ID2D1Bitmap* source){
         if(a.points.empty())return;SetColor(paint,a.color);
@@ -437,11 +516,7 @@ struct App::Impl {
         for(size_t i=0;i<annotations.size();++i)if(!edit||editingText!=static_cast<int>(i))DrawAnnotation(annotationTarget.Get(),paint.Get(),*annotations[i],annotationSource.Get());
         if(SUCCEEDED(annotationTarget->EndDraw())){annotationBitmap.Reset();annotationTarget->GetBitmap(&annotationBitmap);annotationsDirty=false;}
     }
-    void PaintScene(){
-        if(!sceneDirty&&sceneBitmap)return;
-        if(!sceneTarget&&FAILED(target->CreateCompatibleRenderTarget(D2D1::SizeF(static_cast<float>(image.width),static_cast<float>(image.height)),&sceneTarget)))throw LocalizedError(TextId::ErrorCouldNotCacheTheEditor);
-        const auto screenTarget=target;target=sceneTarget.Get();
-        target->BeginDraw();target->SetTransform(D2D1::Matrix3x2F::Identity());
+    void DrawScene(){
         target->DrawBitmap(background.Get());
         if(mode==Mode::MovingObject||annotationsDirty){for(size_t i=0;i<annotations.size();++i)if(!edit||editingText!=static_cast<int>(i))DrawAnnotation(target.Get(),brush.Get(),mode==Mode::MovingObject&&object==static_cast<int>(i)?preview:*annotations[i],background.Get());}
         else if(annotationBitmap)target->DrawBitmap(annotationBitmap.Get());
@@ -465,6 +540,12 @@ struct App::Impl {
         Button(CloseButton());Icon(ui::Icon::Close,D2D1::RectF(static_cast<float>(image.width-36),20,static_cast<float>(image.width-20),36));}
         if(mode!=Mode::Creating&&!status.empty()){Panel(D2D1::RectF(28,110,static_cast<float>(std::min(image.width-28,850)),166));Label(status,D2D1::RectF(42,128,static_cast<float>(std::min(image.width-42,836)),162),0xffc857,true);}
         if(edit)PaintTextEditor();if(palette)PaintPalette();
+    }
+    void CacheScene(){
+        if(!sceneDirty&&sceneBitmap)return;
+        if(!sceneTarget&&FAILED(target->CreateCompatibleRenderTarget(D2D1::SizeF(static_cast<float>(image.width),static_cast<float>(image.height)),&sceneTarget)))throw LocalizedError(TextId::ErrorCouldNotCacheTheEditor);
+        const auto screenTarget=target;target=sceneTarget.Get();
+        target->BeginDraw();target->SetTransform(D2D1::Matrix3x2F::Identity());DrawScene();
         const HRESULT result=target->EndDraw();target=screenTarget;
         if(FAILED(result))throw LocalizedError(TextId::ErrorCouldNotRenderTheEditor);
         sceneBitmap.Reset();if(FAILED(sceneTarget->GetBitmap(&sceneBitmap)))throw LocalizedError(TextId::ErrorCouldNotRetrieveTheEditorCache);sceneDirty=false;
@@ -485,7 +566,7 @@ struct App::Impl {
     }
     RECT OverlayBounds()const{
         if(!ToolPointerAtMouse())return {};
-        const float radius=std::max(2.0f,(tool==Tool::Pixelate?pixelSize:thickness)*.5f);
+        const float radius=tool==Tool::Number?25.0f:std::max(2.0f,(tool==Tool::Pixelate?pixelSize:thickness)*.5f);
         RECT area{static_cast<LONG>(std::floor(mouse.x-radius-14)),static_cast<LONG>(std::floor(mouse.y-radius-26)),static_cast<LONG>(std::ceil(mouse.x+radius+100)),static_cast<LONG>(std::ceil(mouse.y+radius+44))};
         if(PickerAtMouse()){
             const float x=std::clamp(mouse.x+24,8.0f,image.width-136.0f),y=std::clamp(mouse.y+24,8.0f,image.height-161.0f);
@@ -493,30 +574,73 @@ struct App::Impl {
         }
         const RECT bounds{0,0,image.width,image.height};IntersectRect(&area,&area,&bounds);return area;
     }
-    void PresentFrame(HRESULT drawing){
-        const HRESULT result=SUCCEEDED(drawing)?renderer.Present():drawing;
+    void PresentFrame(HRESULT drawing,const RECT* dirty=nullptr){
+        const HRESULT result=SUCCEEDED(drawing)?renderer.Present(retryPresent?nullptr:dirty):drawing;
         frameSlotReady=false;
         if(result==DXGI_ERROR_WAS_STILL_DRAWING){retryPresent=true;RequestFrame(false);return;}
         retryPresent=false;
         if(FAILED(result)){DropRenderResources(true);RequestFrame();if(headless)throw LocalizedError(TextId::ErrorFramePresentationError,std::to_wstring(static_cast<unsigned>(result)));}
         else if(captureShowPending){captureShowPending=false;ShowWindow(window,SW_SHOWNOACTIVATE);SetForegroundWindow(window);SetFocus(window);RefreshCursor(true);RequestFrame(false);}
     }
+    RECT SelectionPaintBounds()const{
+        // Размеры рисуются над левым краем, ручки выступают на четыре пикселя.
+        D2D1_RECT_F visual=D2D1::RectF(selection.left-8,selection.top-32,
+            std::max(selection.right+8,selection.left+184),std::max(selection.bottom+8,38.0f));
+        if(ToolsVisible()){
+            for(const auto& panel:{Tools(),Actions()}){
+                visual.left=std::min(visual.left,panel.left-8);visual.top=std::min(visual.top,panel.top-8);
+                visual.right=std::max(visual.right,panel.right+8);visual.bottom=std::max(visual.bottom,panel.bottom+10);
+            }
+        }
+        const RECT frame{0,0,image.width,image.height};
+        RECT bounds{static_cast<LONG>(std::floor(visual.left)),static_cast<LONG>(std::floor(visual.top)),
+            static_cast<LONG>(std::ceil(visual.right)),static_cast<LONG>(std::ceil(visual.bottom))};
+        IntersectRect(&bounds,&bounds,&frame);
+        return bounds;
+    }
     void Paint(){
         if(!active||image.pixels.empty())return;Resources();if(mode!=Mode::MovingObject)CacheAnnotations();UploadLiveStroke();PreparePalette();
-        const bool rebuild=sceneDirty||!sceneBitmap;PaintScene();const RECT currentOverlay=OverlayBounds();RECT dirty{};
+        // При перетаскивании сцена меняется на каждом кадре. Рисуем сразу в итоговую поверхность.
+        if(dragging){
+            RECT dirty{};
+            if(DraggingFrame()){
+                SampleFramePointer();
+                const RECT bounds=SelectionPaintBounds();
+                if(!IsRectEmpty(&previousFrameBounds))UnionRect(&dirty,&previousFrameBounds,&bounds);
+                previousFrameBounds=bounds;
+            }
+            const bool partial=!IsRectEmpty(&dirty);
+            target->BeginDraw();target->SetTransform(D2D1::Matrix3x2F::Identity());
+            if(partial)target->PushAxisAlignedClip(D2D1::RectF(static_cast<float>(dirty.left),static_cast<float>(dirty.top),
+                static_cast<float>(dirty.right),static_cast<float>(dirty.bottom)),D2D1_ANTIALIAS_MODE_ALIASED);
+            DrawScene();PaintBrushPreview();
+            if(partial)target->PopAxisAlignedClip();
+            PresentFrame(target->EndDraw(),partial?&dirty:nullptr);
+            sceneDirty=true;return;
+        }
+        const bool rebuild=sceneDirty||!sceneBitmap;CacheScene();const RECT currentOverlay=OverlayBounds();RECT dirty{};
         if(rebuild)dirty={0,0,image.width,image.height};else UnionRect(&dirty,&previousOverlay,&currentOverlay);
         previousOverlay=currentOverlay;if(IsRectEmpty(&dirty)){if(retryPresent)PresentFrame(S_OK);return;}
         target->BeginDraw();target->SetTransform(D2D1::Matrix3x2F::Identity());
         // Восстанавливаем прежний указатель и рисуем новый только в затронутой части сохранённого кадра.
         target->PushAxisAlignedClip(D2D1::RectF(static_cast<float>(dirty.left),static_cast<float>(dirty.top),static_cast<float>(dirty.right),static_cast<float>(dirty.bottom)),D2D1_ANTIALIAS_MODE_ALIASED);
         target->DrawBitmap(sceneBitmap.Get());PaintPicker();PaintBrushPreview();if(PickerAtMouse())PaintToolPointer(ui::Icon::Eyedropper);
-        target->PopAxisAlignedClip();PresentFrame(target->EndDraw());
+        target->PopAxisAlignedClip();PresentFrame(target->EndDraw(),rebuild?nullptr:&dirty);
     }
-    void PaintFrame(){framePending=false;if(settings)PaintSettings();else if(trayMenu)PaintTray();else Paint();}
+    void PaintFrame(){framePending=false;Paint();}
     Image Export(){
         CommitText();const int x=std::clamp(static_cast<int>(selection.left),0,image.width-1),y=std::clamp(static_cast<int>(selection.top),0,image.height-1);
         const int width=std::clamp(static_cast<int>(selection.right)-x,1,image.width-x),height=std::clamp(static_cast<int>(selection.bottom)-y,1,image.height-y);
-        Image result{x,y,width,height,{}};const HDC dc=CreateCompatibleDC(nullptr);
+        Image result{x,y,width,height,{}};
+        if(annotations.empty()){
+            result.pixels.resize(static_cast<size_t>(width)*height);
+            for(int row=0;row<height;++row){
+                std::copy_n(image.pixels.data()+static_cast<size_t>(y+row)*image.width+x,width,
+                    result.pixels.data()+static_cast<size_t>(row)*width);
+            }
+            return result;
+        }
+        const HDC dc=CreateCompatibleDC(nullptr);
         BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=width;info.bmiHeader.biHeight=-height;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
         void* bits{};const HBITMAP bitmap=CreateDIBSection(dc,&info,DIB_RGB_COLORS,&bits,nullptr,0);
         if(!bitmap){DeleteDC(dc);throw LocalizedError(TextId::ErrorCouldNotPrepareTheImage);}
@@ -538,6 +662,35 @@ struct App::Impl {
     }
     void Copy(){if(selected){CopyImage(Export(),window);FinishCapture();}}
     void Save();
+    enum class EditorCommand {Copy,Save,Folder,Close,Undo,Redo};
+    bool Execute(EditorCommand action,HWND source=nullptr){
+        try{
+            switch(action){
+            case EditorCommand::Copy:
+                // Выделенные символы копирует сам EDIT.
+                if(source&&source==edit&&TextHasSelection())return false;
+                Copy();
+                break;
+            case EditorCommand::Save:Save();break;
+            case EditorCommand::Folder:CommitText();ChooseFolder(window);break;
+            case EditorCommand::Close:FinishCapture();break;
+            case EditorCommand::Undo:Undo();break;
+            case EditorCommand::Redo:Redo();break;
+            }
+        }catch(const std::exception& error){Error(error);}
+        return true;
+    }
+    bool EditorShortcut(WPARAM key,HWND source){
+        const bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+        if(ctrl&&key=='C')return Execute(EditorCommand::Copy,source);
+        if(ctrl&&key=='S')return Execute(EditorCommand::Save);
+        if(key==VK_F2)return Execute(EditorCommand::Folder);
+        if(source==edit)return false;
+        if(ctrl&&key=='Z')return Execute(GetKeyState(VK_SHIFT)&0x8000?EditorCommand::Redo:EditorCommand::Undo);
+        if(ctrl&&key=='Y')return Execute(EditorCommand::Redo);
+        if(key==VK_RETURN)return Execute(EditorCommand::Copy);
+        return false;
+    }
     ComPtr<IDWriteTextLayout> CreateTextLayout(const Annotation& annotation){
         ComPtr<IDWriteTextFormat> format;ComPtr<IDWriteTextLayout> layout;
         if(FAILED(textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_SEMI_BOLD,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,annotation.fontSize,L"ru-ru",&format)))return {};
@@ -596,10 +749,8 @@ struct App::Impl {
     static LRESULT CALLBACK EditProc(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam,UINT_PTR,DWORD_PTR data){
         auto* self=reinterpret_cast<Impl*>(data);
         if((message==WM_SYSKEYDOWN||message==WM_SYSKEYUP)&&wparam==VK_MENU){self->Modifier(wparam,message==WM_SYSKEYDOWN);return 0;}
-        if((message==WM_COPY||(message==WM_KEYDOWN&&wparam=='C'&&(GetKeyState(VK_CONTROL)&0x8000)))&&!self->TextHasSelection()){
-            if(GetMessageExtraInfo()!=0xca7e)self->Copy();return 0;
-        }
-        if(message==WM_KEYDOWN&&wparam=='S'&&(GetKeyState(VK_CONTROL)&0x8000)){self->Save();return 0;}
+        if(message==WM_COPY&&self->Execute(EditorCommand::Copy,hwnd))return 0;
+        if(message==WM_KEYDOWN&&self->EditorShortcut(wparam,hwnd))return 0;
         if((message==WM_KEYDOWN||message==WM_KEYUP)&&wparam==VK_TAB){self->Modifier(wparam,message==WM_KEYDOWN);return 0;}
         if(message==WM_CHAR&&wparam==VK_TAB)return 0;
         if(message==WM_KEYDOWN&&wparam=='A'&&(GetKeyState(VK_CONTROL)&0x8000)){SendMessageW(hwnd,EM_SETSEL,0,-1);self->ReadText();return 0;}
@@ -607,7 +758,6 @@ struct App::Impl {
         if(message==WM_KEYDOWN&&wparam==VK_RETURN&&!(GetKeyState(VK_SHIFT)&0x8000)){self->CommitText();return 0;}
         if(message==WM_KEYDOWN&&wparam==VK_ESCAPE){self->CancelText();SetFocus(self->window);self->RefreshCursor(true);return 0;}
         if(message==WM_MOUSEWHEEL){self->Wheel(GET_WHEEL_DELTA_WPARAM(wparam),GET_KEYSTATE_WPARAM(wparam));self->RefreshCursor();return 0;}
-        if(message==WM_KEYDOWN&&wparam==VK_F2){self->CommitText();self->ChooseFolder();return 0;}
         const auto result=DefSubclassProc(hwnd,message,wparam,lparam);
         if(self->edit==hwnd&&(message==WM_CHAR||message==WM_KEYDOWN||message==WM_PASTE||message==WM_CUT||message==WM_CLEAR||message==WM_UNDO||message==WM_IME_COMPOSITION)){self->ReadText(message==WM_KEYDOWN?wparam:0);}
         return result;
@@ -647,10 +797,13 @@ struct App::Impl {
             if(Inside(panel,point)){
                 bool handled=false;
                 for(int i=0;i<ToolCount;++i)if(Inside(ToolButton(i),point)){SelectTool(static_cast<Tool>(i));handled=true;break;}
-                if(!handled){if(Inside(UndoButton(false),point))Undo();else if(Inside(UndoButton(true),point))Redo();else if(Inside(ColorButton(),point))OpenPalette(D2D1::Point2F(panel.right+10,panel.top));}
+                if(!handled){if(Inside(UndoButton(false),point))Execute(EditorCommand::Undo);else if(Inside(UndoButton(true),point))Execute(EditorCommand::Redo);else if(Inside(ColorButton(),point))OpenPalette(D2D1::Point2F(panel.right+10,panel.top));}
                 RequestFrame();return;
             }
-            if(Inside(actions,point)){const float x=point.x-actions.left;if(x<140)Copy();else if(x<278)Save();else if(x<380)ChooseFolder();else FinishCapture();return;}
+            if(Inside(actions,point)){
+                constexpr std::array commands{EditorCommand::Copy,EditorCommand::Save,EditorCommand::Folder,EditorCommand::Close};
+                const auto action=ActionAt(point);if(action>=0)Execute(commands[action]);return;
+            }
         }
         if(PickerAtMouse()){
             const int x=std::clamp(static_cast<int>(point.x),0,image.width-1),y=std::clamp(static_cast<int>(point.y),0,image.height-1);
@@ -666,8 +819,36 @@ struct App::Impl {
         else if(tool==Tool::Text){
             StartText(point);RequestFrame();return;
         }else if(tool==Tool::Number){Append({tool,{point},color,thickness,std::to_wstring(NextNumber())});RequestFrame();return;}
-        else{mode=Mode::Drawing;preview={tool,{point},color,thickness,{}};preview.pixelSize=pixelSize;if(IsBrush(tool)){preview.widths={thickness};liveStroke.Begin(image.width,image.height,point,BrushRadius(thickness));liveStrokeBitmap.Reset();}else preview.points.push_back(point);}
-        dragging=true;if(!headless)SetCapture(window);RequestFrame();
+        else{mode=Mode::Drawing;preview={tool,{point},color,thickness,{}};preview.pixelSize=pixelSize;if(IsBrush(tool)){liveStroke.Begin(image.width,image.height,point,BrushRadius(thickness));liveStrokeBitmap.Reset();}else preview.points.push_back(point);}
+        previousFrameBounds={};dragging=true;if(!headless)SetCapture(window);RequestFrame();
+    }
+    bool DraggingFrame()const{return mode==Mode::Creating||mode==Mode::Moving||mode==Mode::Resizing;}
+    void UpdateSelection(D2D1_POINT_2F point){
+        const float dx=point.x-down.x,dy=point.y-down.y;
+        if(mode==Mode::Creating)selection=Normalize(down,point);
+        else if(mode==Mode::Moving){
+            const float width=originalSelection.right-originalSelection.left,height=originalSelection.bottom-originalSelection.top;
+            const float x=std::clamp(originalSelection.left+dx,0.0f,image.width-width);
+            const float y=std::clamp(originalSelection.top+dy,0.0f,image.height-height);
+            selection=D2D1::RectF(x,y,x+width,y+height);
+        }else if(mode==Mode::Resizing){
+            auto r=originalSelection;
+            if(handle==0||handle==6||handle==7)r.left=point.x;
+            if(handle==2||handle==3||handle==4)r.right=point.x;
+            if(handle==0||handle==1||handle==2)r.top=point.y;
+            if(handle==4||handle==5||handle==6)r.bottom=point.y;
+            selection=Normalize(D2D1::Point2F(r.left,r.top),D2D1::Point2F(r.right,r.bottom));
+        }
+    }
+    void SampleFramePointer(){
+        if(headless||GetCapture()!=window)return;
+        const int primary=GetSystemMetrics(SM_SWAPBUTTON)?VK_RBUTTON:VK_LBUTTON;
+        if(!(GetAsyncKeyState(primary)&0x8000))return;
+        POINT position{};
+        if(!GetCursorPos(&position)||!ScreenToClient(window,&position))return;
+        mouse=D2D1::Point2F(std::clamp(static_cast<float>(position.x),0.0f,static_cast<float>(image.width)),
+            std::clamp(static_cast<float>(position.y),0.0f,static_cast<float>(image.height)));
+        UpdateSelection(mouse);
     }
     void Move(D2D1_POINT_2F point){
         if(textDragging){mouse=point;preview.points.front()=D2D1::Point2F(std::clamp(textOrigin.x+point.x-textDragStart.x,0.0f,static_cast<float>(image.width)),std::clamp(textOrigin.y+point.y-textDragStart.y,0.0f,static_cast<float>(image.height)));RequestFrame();return;}
@@ -676,49 +857,49 @@ struct App::Impl {
         point.x=std::clamp(point.x,0.0f,static_cast<float>(image.width));point.y=std::clamp(point.y,0.0f,static_cast<float>(image.height));mouse=point;
         if(dragging){
             const float dx=point.x-down.x,dy=point.y-down.y;
-            if(mode==Mode::Creating)selection=Normalize(down,point);
-            else if(mode==Mode::Moving){
-                const float x=std::clamp(originalSelection.left+dx,0.0f,image.width-(originalSelection.right-originalSelection.left)),y=std::clamp(originalSelection.top+dy,0.0f,image.height-(originalSelection.bottom-originalSelection.top));
-                selection=D2D1::RectF(x,y,x+originalSelection.right-originalSelection.left,y+originalSelection.bottom-originalSelection.top);
-            }else if(mode==Mode::Resizing){
-                auto r=originalSelection;if(handle==0||handle==6||handle==7)r.left=point.x;if(handle==2||handle==3||handle==4)r.right=point.x;if(handle==0||handle==1||handle==2)r.top=point.y;if(handle==4||handle==5||handle==6)r.bottom=point.y;
-                selection=Normalize(D2D1::Point2F(r.left,r.top),D2D1::Point2F(r.right,r.bottom));
-            }else if(mode==Mode::Drawing){
-                if(IsBrush(preview.tool)){if(Distance(preview.points.back(),point)>=.7f){preview.points.push_back(point);preview.widths.push_back(thickness);liveStroke.Add(point,BrushRadius(thickness));}}else preview.points.back()=ConstrainEndpoint(down,point,preview.tool);
+            if(DraggingFrame())UpdateSelection(point);
+            else if(mode==Mode::Drawing){
+                if(IsBrush(preview.tool)){if(Distance(liveStroke.Last(),point)>=.7f)liveStroke.Add(point,BrushRadius(thickness));}else preview.points.back()=ConstrainEndpoint(down,point,preview.tool);
             }else if(mode==Mode::MovingObject&&object>=0){preview=originalObject;for(auto& p:preview.points){p.x+=dx;p.y+=dy;}}
         }
         const int nextHover=HoverAt(point);const bool changed=nextHover!=hover;hover=nextHover;
-        if(dragging||picker||tool==Tool::Eyedropper||changed||selected||palette)RequestFrame(dragging||changed||palette||edit);
+        if(dragging||changed||palette||ToolPointerAtMouse()||!IsRectEmpty(&previousOverlay))RequestFrame(dragging||changed||palette);
     }
     void Up(D2D1_POINT_2F point){
         if(textDragging){Move(point);textDragging=false;ReleaseCapture();SetFocus(edit);RefreshCursor();return;}
         if(textSelecting){SelectTextAt(point,true);textSelecting=false;ReleaseCapture();return;}
         if(paletteDrag){mouse=point;PaletteValue(point);paletteDrag=0;ReleaseCapture();return;}
-        if(!dragging)return;Move(point);if(mode==Mode::Drawing){if(IsBrush(preview.tool))preview.stroke=liveStroke.Finish();Append(preview);}
+        if(!dragging)return;Move(point);if(mode==Mode::Drawing){if(IsBrush(preview.tool))preview.stroke=liveStroke.Finish();Append(std::move(preview));}
         else if(mode==Mode::MovingObject&&object>=0&&Distance(point,down)>.1f){Remember();annotations[object]=std::make_shared<const Annotation>(preview);}
         liveStroke.Reset();liveStrokeBitmap.Reset();dragging=false;mode=Mode::None;ReleaseCapture();if(selection.right-selection.left<2||selection.bottom-selection.top<2)selected=false;RequestFrame();
     }
+    void CancelPointerInteraction(){
+        if(!dragging&&!textDragging&&!textSelecting&&!paletteDrag)return;
+        if(dragging){
+            selection=originalSelection;selected=selectedBefore;
+            liveStroke.Reset();liveStrokeBitmap.Reset();preview={};
+        }
+        if(textDragging)preview.points.front()=textOrigin;
+        dragging=textDragging=textSelecting=false;paletteDrag=0;mode=Mode::None;
+        if(GetCapture()==window)ReleaseCapture();
+        RefreshCursor();RequestFrame();
+    }
     void Key(WPARAM key){
-        const bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0,shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
-        if(settings||trayMenu){if(key==VK_ESCAPE)Hide();else if(settings&&key==VK_F2)ChooseFolder();return;}
+        const bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         if(palette){if(key==VK_ESCAPE||key==VK_RETURN)ClosePalette();return;}
-        // Caramba читает выделенный текст через Ctrl+C с меткой 0xCA7E.
-        // На холсте это запрос переключателя, а не команда копирования снимка.
-        if(!edit&&ctrl&&key=='C'&&GetMessageExtraInfo()==0xca7e)return;
-        if(key==VK_ESCAPE){if(dragging){liveStroke.Reset();liveStrokeBitmap.Reset();dragging=false;mode=Mode::None;ReleaseCapture();selection=originalSelection;selected=selectedBefore;RequestFrame();}else FinishCapture();return;}
-        if(ctrl&&((key=='Z'&&shift)||key=='Y'))Redo();else if(ctrl&&key=='Z')Undo();else if(ctrl&&key=='C')Copy();else if(ctrl&&key=='S')Save();else if(key==VK_F2)ChooseFolder();else if(key==VK_RETURN)Copy();
-        else if(!dragging){if(key=='P'&&!ctrl)SelectTool(Tool::Pen);else if(key=='A'&&!ctrl)SelectTool(Tool::Arrow);else if(key=='T'&&!ctrl)SelectTool(Tool::Text);else if(key>='1'&&key<='9'&&!ctrl)SelectTool(static_cast<Tool>(key-'1'));}
+        if(key==VK_ESCAPE){if(dragging)CancelPointerInteraction();else Execute(EditorCommand::Close);return;}
+        if(EditorShortcut(key,window))return;
+        if(!dragging){if(key=='P'&&!ctrl)SelectTool(Tool::Pen);else if(key=='A'&&!ctrl)SelectTool(Tool::Arrow);else if(key=='T'&&!ctrl)SelectTool(Tool::Text);else if(key>='1'&&key<='9'&&!ctrl)SelectTool(static_cast<Tool>(key-'1'));}
         RequestFrame();
     }
     void Wheel(int delta,UINT modifiers){
-        if(settings||trayMenu)return;
         RefreshCursor(true);
         wheelRemainder+=delta;const int steps=wheelRemainder/WHEEL_DELTA;wheelRemainder%=WHEEL_DELTA;if(!steps)return;
         if(modifiers&MK_SHIFT){if(dragging||paletteDrag||textSelecting||textDragging)return;CommitText();if(palette)ClosePalette();const int next=(static_cast<int>(tool)-steps%ToolCount+ToolCount)%ToolCount;SelectTool(static_cast<Tool>(next));RefreshCursor(true);RequestFrame();return;}
         if(palette){if(Inside(ColorField(),mouse)||OnBrightness(mouse)){value=std::clamp(value+steps*.04f,0.0f,1.0f);color=ui::HsvToRgb(hue,saturation,value);SyncHex();RequestFrame();}return;}
         if(edit||tool==Tool::Text){textSize=std::clamp(textSize+steps*2,8.0f,192.0f);if(edit){preview.fontSize=textSize;UpdateTextFont();}RequestFrame();return;}
         if(tool==Tool::Pixelate){pixelSize=std::clamp(pixelSize+steps*2,2,96);if(mode==Mode::Drawing&&preview.tool==Tool::Pixelate)preview.pixelSize=pixelSize;}
-        else{const float next=std::clamp(thickness+steps,1.0f,128.0f);if(next==thickness)return;thickness=next;if(mode==Mode::Drawing){if(IsBrush(preview.tool)){preview.points.push_back(mouse);preview.widths.push_back(thickness);liveStroke.Add(mouse,BrushRadius(thickness));}else preview.width=thickness;}}
+        else{const float next=std::clamp(thickness+steps,1.0f,128.0f);if(next==thickness)return;thickness=next;if(mode==Mode::Drawing){if(IsBrush(preview.tool)){liveStroke.Add(mouse,BrushRadius(thickness));}else preview.width=thickness;}}
         RequestFrame();
     }
     D2D1_POINT_2F ConstrainEndpoint(D2D1_POINT_2F origin,D2D1_POINT_2F point,Tool shape)const{
@@ -741,20 +922,18 @@ struct App::Impl {
     D2D1_RECT_F CloseButton()const{return D2D1::RectF(static_cast<float>(image.width-44),12,static_cast<float>(image.width-12),44);}
     int HandleAtMouse()const{if(!ToolsVisible()||dragging)return -1;const auto handles=Handles();for(int i=0;i<8;++i)if(Distance(mouse,handles[i])<10)return i;return -1;}
     bool OverControls()const{return Inside(CloseButton(),mouse)||(ToolsVisible()&&(Inside(Tools(),mouse)||Inside(Actions(),mouse)));}
-    bool CanvasAtMouse()const{return active&&!trayMenu&&!settings&&mouseInside&&!palette&&!edit&&mode!=Mode::Creating&&(mode==Mode::Drawing||(!OverControls()&&HandleAtMouse()<0));}
+    bool CanvasAtMouse()const{return active&&mouseInside&&!palette&&!edit&&(mode==Mode::Drawing||(!dragging&&!OverControls()&&HandleAtMouse()<0));}
     bool PickerAtMouse()const{return CanvasAtMouse()&&!dragging&&(picker||tool==Tool::Eyedropper);}
     bool BrushAtMouse()const{return CanvasAtMouse()&&selected&&!PickerAtMouse()&&(mode==Mode::None||mode==Mode::Drawing)&&(mode==Mode::Drawing||Inside(selection,mouse))&&(tool==Tool::Pen||tool==Tool::Eraser||tool==Tool::Pixelate||tool==Tool::Line||tool==Tool::Arrow||tool==Tool::Rectangle||tool==Tool::Ellipse);}
     bool ToolPointerAtMouse()const{return BrushAtMouse()||PickerAtMouse()||(CanvasAtMouse()&&selected&&Inside(selection,mouse)&&(tool==Tool::Fill||tool==Tool::Number||tool==Tool::Eraser));}
     bool InteractiveAtMouse()const{
-        if(settings)return Inside(CloseButton(),mouse)||Inside(StartupButton(),mouse)||(!startupCommand.empty()&&!startupHere&&Inside(StartupOffButton(),mouse))||Inside(FolderSettingButton(),mouse)||Inside(HotkeySettingButton(),mouse)||Inside(HotkeyValue(),mouse)||Inside(LanguageButton(false),mouse)||Inside(LanguageButton(true),mouse);
-        if(trayMenu){for(int i=0;i<4;++i)if(Inside(TrayRow(i),mouse))return true;return false;}
         if(palette){if(Inside(PaletteClose(),mouse)||Inside(ColorField(),mouse)||OnBrightness(mouse))return true;for(int i=0;i<24;++i)if(Inside(ColorCell(i),mouse))return true;for(int i=0;i<12;++i)if(Inside(ColorCell(i,true),mouse)||(customColors[i]&&Inside(ColorDelete(i),mouse)))return true;return false;}
         if(dragging)return false;
         if(mode!=Mode::Creating&&Inside(CloseButton(),mouse))return true;
         if(!ToolsVisible()||dragging)return false;
         for(int i=0;i<ToolCount;++i)if(Inside(ToolButton(i),mouse))return true;
         if(Inside(ColorButton(),mouse)||(!undoStack.empty()&&Inside(UndoButton(false),mouse))||(!redoStack.empty()&&Inside(UndoButton(true),mouse)))return true;
-        if(Inside(Actions(),mouse)){const float x=mouse.x-Actions().left;return (x>=5&&x<=140)||(x>=142&&x<=278)||(x>=280&&x<=380)||(x>=385&&x<=419);}
+        if(Inside(Actions(),mouse))return ActionAt(mouse)>=0;
         return false;
     }
     HCURSOR CursorAtMouse(){
@@ -762,7 +941,7 @@ struct App::Impl {
         if(edit&&(textSelecting||(!OverControls()&&Inside(TextBounds(),mouse))))return LoadCursorW(nullptr,IDC_IBEAM);
         if(hexEdit&&Inside(D2D1::RectF(paletteBounds.left+31,paletteBounds.top+283,paletteBounds.left+107,paletteBounds.top+305),mouse))return LoadCursorW(nullptr,IDC_IBEAM);
         if(InteractiveAtMouse())return cursors.Hand();
-        if(palette||trayMenu||settings)return cursors.Arrow();
+        if(palette)return cursors.Arrow();
         if(dragging&&(mode==Mode::Moving||mode==Mode::MovingObject))return LoadCursorW(nullptr,IDC_SIZEALL);
         const int grip=mode==Mode::Resizing?handle:HandleAtMouse();
         if(grip>=0)return LoadCursorW(nullptr,grip==0||grip==4?IDC_SIZENWSE:grip==2||grip==6?IDC_SIZENESW:grip==1||grip==5?IDC_SIZENS:IDC_SIZEWE);
@@ -773,7 +952,14 @@ struct App::Impl {
     }
     void RefreshCursor(bool readPosition=false){
         if(!active||headless)return;
-        if(readPosition){POINT position{};GetCursorPos(&position);ScreenToClient(window,&position);mouse=D2D1::Point2F(static_cast<float>(position.x),static_cast<float>(position.y));RECT bounds{};GetClientRect(window,&bounds);mouseInside=PtInRect(&bounds,position)!=FALSE;if(mouseInside){TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,window,0};if(!headless)TrackMouseEvent(&tracking);}}
+        if(readPosition){
+            POINT position{};GetCursorPos(&position);ScreenToClient(window,&position);
+            mouse=D2D1::Point2F(static_cast<float>(position.x),static_cast<float>(position.y));
+            RECT bounds{};GetClientRect(window,&bounds);
+            const bool inside=PtInRect(&bounds,position)!=FALSE;
+            if(inside&&!mouseInside){TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,window,0};TrackMouseEvent(&tracking);}
+            mouseInside=inside;
+        }
         if(mouseInside||dragging)SetCursor(CursorAtMouse());
     }
     void Modifier(WPARAM key,bool pressed){
@@ -826,79 +1012,172 @@ struct App::Impl {
         PaintToolPointer(static_cast<ui::Icon>(tool));
         Label(std::to_wstring(tool==Tool::Pixelate?pixelSize:static_cast<int>(thickness))+L" px",D2D1::RectF(mouse.x+radius+8,mouse.y+radius+6,mouse.x+radius+80,mouse.y+radius+31),0xffffff,true);
     }
-    void ShowUtility(bool menu){
-        Hide();trayMenu=menu;settings=!menu;active=true;selected=false;status.clear();const int width=menu?280:680,height=menu?240:664;image={0,0,width,height,{}};image.pixels.assign(static_cast<size_t>(width)*height,0xff1c1c1c);
-        POINT point{};GetCursorPos(&point);MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST),&monitor);
-        const int x=menu?point.x:(monitor.rcWork.left+monitor.rcWork.right-width)/2,y=menu?point.y-height:(monitor.rcWork.top+monitor.rcWork.bottom-height)/2;
-        SetWindowLongPtrW(window,GWL_STYLE,WS_POPUP|WS_CLIPCHILDREN);SetWindowPos(window,menu?HWND_TOPMOST:HWND_NOTOPMOST,std::clamp<LONG>(x,monitor.rcWork.left,std::max(monitor.rcWork.left,monitor.rcWork.right-width)),std::clamp<LONG>(y,monitor.rcWork.top,std::max(monitor.rcWork.top,monitor.rcWork.bottom-height)),width,height,SWP_FRAMECHANGED|SWP_SHOWWINDOW);SetForegroundWindow(window);SetFocus(window);RefreshCursor(true);RequestFrame();
+    void ShowTrayMenu(){
+        if(menuTracking||folderDialogOpen)return;
+        const auto captureLabel=std::wstring(Text(TextId::ScreenCapture2))+L"\t"+HotkeyName();
+        HMENU menu=CreatePopupMenu();
+        if(!menu)return;
+        enum {CaptureItem=1,SettingsItem,FolderItem,ExitItem};
+        AppendMenuW(menu,MF_STRING,CaptureItem,captureLabel.c_str());
+        AppendMenuW(menu,MF_STRING,SettingsItem,Text(TextId::Settings));
+        AppendMenuW(menu,MF_STRING,FolderItem,Text(TextId::SaveFolder2));
+        AppendMenuW(menu,MF_STRING,ExitItem,Text(TextId::Exit));
+        POINT point{};GetCursorPos(&point);
+        HWND owner=IsWindowVisible(settingsWindow)?settingsWindow:window;
+        SetForegroundWindow(owner);
+        menuTracking=true;
+        const UINT choice=TrackPopupMenuEx(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_RIGHTBUTTON,
+            point.x,point.y,owner,nullptr);
+        menuTracking=false;
+        DestroyMenu(menu);PostMessageW(owner,WM_NULL,0,0);
+        if(captureAfterMenu){captureAfterMenu=false;Capture();}
+        else if(choice==CaptureItem)Capture(true);
+        else if(choice==SettingsItem)ShowSettings();
+        else if(choice==FolderItem){ShowSettings();SettingsAction(IDC_CHOOSE_FOLDER);}
+        else if(choice==ExitItem)DestroyWindow(window);
     }
-    void ShowTrayMenu(){ShowUtility(true);}
-    void ShowSettings(){ShowUtility(false);ReadStartup();}
-    D2D1_RECT_F TrayRow(int index)const{return D2D1::RectF(8,53+index*44.0f,272,93+index*44.0f);}
-    D2D1_RECT_F StartupButton()const{return D2D1::RectF(574,430,636,470);}
-    D2D1_RECT_F StartupOffButton()const{return D2D1::RectF(492,558,632,588);}
-    D2D1_RECT_F FolderSettingButton()const{return D2D1::RectF(524,280,632,318);}
-    D2D1_RECT_F HotkeySettingButton()const{return D2D1::RectF(524,182,632,220);}
-    D2D1_RECT_F HotkeyValue()const{return D2D1::RectF(48,182,506,220);}
-    D2D1_RECT_F LanguageButton(bool russian)const{return russian?D2D1::RectF(522,28,632,66):D2D1::RectF(402,28,512,66);}
     void SetLanguage(Language chosen){
         std::filesystem::create_directories(base/L"data");
         if(!WritePrivateProfileStringW(L"Sparkshot",L"Language",chosen==Language::Russian?L"ru":L"en",(base/L"data"/L"settings.ini").c_str()))throw LocalizedError(TextId::ErrorCouldNotSaveSettingsNextToTheExe);
-        language=chosen;LoadLanguage();status.clear();RequestFrame();
+        language=chosen;LoadLanguage();settingsStatus.clear();
     }
-    void SettingsDown(D2D1_POINT_2F point){
-        mouse=point;if(Inside(CloseButton(),point)){Hide();return;}if(choosingHotkey)status.clear();choosingHotkey=false;
-        if(Inside(LanguageButton(false),point))SetLanguage(Language::English);
-        else if(Inside(LanguageButton(true),point))SetLanguage(Language::Russian);
-        else if(Inside(StartupButton(),point))SetStartup(!startupHere);
-        else if(!startupCommand.empty()&&!startupHere&&Inside(StartupOffButton(),point))SetStartup(false);
-        else if(Inside(FolderSettingButton(),point)){ChooseFolder();status=FormatLocalized(Text(TextId::SaveFolder),folder.wstring());}
-        else if(Inside(HotkeySettingButton(),point)||Inside(HotkeyValue(),point)){choosingHotkey=true;status=Text(TextId::PressAKeyOrShortcutEGPrintScreenOrCtrlAltSEscCan);SetFocus(window);}
-        RequestFrame();
+    void RefreshSettings(){
+        if(!settingsWindow)return;
+        HWND dlg=settingsWindow;
+        SetWindowTextW(dlg,Text(TextId::Settings));
+        const auto label=[&](int id,TextId text){SetDlgItemTextW(dlg,id,Text(text));};
+        label(IDC_TITLE,TextId::Settings);label(IDC_SUBTITLE,TextId::SparkshotCaptureSavingAndStartup);
+        label(IDCANCEL,TextId::Close);
+        label(IDC_CAPTURE_TITLE,TextId::ScreenCapture2);
+        label(IDC_CAPTURE_HINT,hotkeyAvailable?TextId::ShortcutStartsAreaSelection:TextId::ShortcutIsInUseChooseAnother);
+        SetDlgItemTextW(dlg,IDC_HOTKEY_VALUE,choosingHotkey?Text(TextId::PressANewShortcut):HotkeyName().c_str());
+        label(IDC_CHANGE_KEY,TextId::Change);label(IDC_SAVE_TITLE,TextId::Saving);
+        label(IDC_FOLDER_HINT,TextId::ScreenshotFolderScreenshotNumberPng);label(IDC_CHOOSE_FOLDER,TextId::Choose);
+        SetDlgItemTextW(dlg,IDC_FOLDER_PATH,folder.c_str());
+        label(IDC_STARTUP_TITLE,TextId::Startup);
+        const auto startupHint=startupHere?TextId::OnLaunchThisCopyWhenYouSignInToWindows:
+            startupCommand.empty()?TextId::OffUseTheSwitchOnTheRight:TextId::AnotherCopyTurnOnToReplaceItsPath;
+        label(IDC_STARTUP_HINT,startupHint);label(IDC_STARTUP,startupHint);
+        label(IDC_LOCATION_LABEL,TextId::ApplicationLocation);SetDlgItemTextW(dlg,IDC_EXE_PATH,executable.c_str());
+        bool other=!startupCommand.empty()&&!startupHere;
+        label(IDC_STARTUP_DETAIL,other?TextId::YouCanDisableTheOldEntry:TextId::StartQuietlyInTheTrayWithoutCapturing);
+        label(IDC_DISABLE_OLD,TextId::Disable);ShowWindow(GetDlgItem(dlg,IDC_DISABLE_OLD),other?SW_SHOW:SW_HIDE);
+        SetDlgItemTextW(dlg,IDC_STATUS,settingsStatus.c_str());
+        RedrawWindow(dlg,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN);
     }
-    void SettingsCard(D2D1_RECT_F bounds,ui::Icon icon,const wchar_t* title){
-        SetColor(brush.Get(),0x262626);target->FillRoundedRectangle(D2D1::RoundedRect(bounds,12,12),brush.Get());SetColor(brush.Get(),0x3b3b3b);target->DrawRoundedRectangle(D2D1::RoundedRect(bounds,12,12),brush.Get(),1);
-        const auto tile=D2D1::RectF(bounds.left+20,bounds.top+20,bounds.left+56,bounds.top+56);SetColor(brush.Get(),0x333333);target->FillRoundedRectangle(D2D1::RoundedRect(tile,9,9),brush.Get());Icon(icon,D2D1::RectF(tile.left+7,tile.top+7,tile.right-7,tile.bottom-7),0xdcdcd5);
-        SetColor(brush.Get(),0xebebe8);target->DrawTextW(title,static_cast<UINT32>(wcslen(title)),settingsSectionFont.Get(),D2D1::RectF(bounds.left+70,bounds.top+19,bounds.right-126,bounds.top+48),brush.Get());
+    void ShowSettings(){
+        ReadStartup();
+        if(!settingsWindow){
+            if(!CreateDialogParamW(instance,MAKEINTRESOURCEW(IDD_SETTINGS),nullptr,SettingsProc,reinterpret_cast<LPARAM>(this)))
+                throw std::runtime_error("CreateDialogParamW failed");
+            POINT point{};GetCursorPos(&point);MONITORINFO monitor{sizeof(monitor)};
+            GetMonitorInfoW(MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST),&monitor);
+            RECT r{};GetWindowRect(settingsWindow,&r);
+            SetWindowPos(settingsWindow,nullptr,std::max(monitor.rcWork.left,(monitor.rcWork.left+monitor.rcWork.right-r.right+r.left)/2),
+                std::max(monitor.rcWork.top,(monitor.rcWork.top+monitor.rcWork.bottom-r.bottom+r.top)/2),0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+        if(active)ShowWindow(window,SW_HIDE);
+        RefreshSettings();
+        ShowWindow(settingsWindow,SW_SHOW);SetForegroundWindow(settingsWindow);
     }
-    void SettingsAction(D2D1_RECT_F bounds,const wchar_t* label,bool on=false,bool chevron=true){
-        SetColor(brush.Get(),on?0x414141:Inside(bounds,mouse)?0x414141:0x333333);target->FillRoundedRectangle(D2D1::RoundedRect(bounds,7,7),brush.Get());SetColor(brush.Get(),on?0xdcdcd5:0x3b3b3b);target->DrawRoundedRectangle(D2D1::RoundedRect(bounds,7,7),brush.Get(),1);
-        Label(label,D2D1::RectF(bounds.left+13,bounds.top+10,bounds.right-(chevron?25:8),bounds.bottom),0xebebe8,true);if(chevron)Icon(ui::Icon::ChevronRight,D2D1::RectF(bounds.right-23,bounds.top+12,bounds.right-9,bounds.bottom-12),0xdcdcd5);
+    void CloseSettings(){
+        choosingHotkey=false;settingsStatus.clear();ShowWindow(settingsWindow,SW_HIDE);
+        if(active){ShowWindow(window,SW_SHOW);SetForegroundWindow(window);SetFocus(edit?edit:window);}
     }
-    void SettingsPath(const std::wstring& path,D2D1_RECT_F bounds){
-        SetColor(brush.Get(),0x1c1c1c);target->FillRoundedRectangle(D2D1::RoundedRect(bounds,6,6),brush.Get());const auto textBounds=D2D1::RectF(bounds.left+12,bounds.top+10,bounds.right-12,bounds.bottom-6);
-        ComPtr<IDWriteTextLayout> layout;ComPtr<IDWriteInlineObject> ellipsis;
-        if(SUCCEEDED(textFactory->CreateTextLayout(path.c_str(),static_cast<UINT32>(path.size()),smallFont.Get(),textBounds.right-textBounds.left,textBounds.bottom-textBounds.top,&layout))){layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(smallFont.Get(),&ellipsis))){const DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER,L'\\',1};layout->SetTrimming(&trimming,ellipsis.Get());}SetColor(brush.Get(),0xebebe8);target->DrawTextLayout(D2D1::Point2F(textBounds.left,textBounds.top),layout.Get(),brush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);}
+    void SettingsAction(int id){
+        if(id==IDCANCEL){CloseSettings();return;}
+        if(choosingHotkey){choosingHotkey=false;settingsStatus.clear();}
+        switch(id){
+        case IDC_ENGLISH:SetLanguage(Language::English);break;
+        case IDC_RUSSIAN:SetLanguage(Language::Russian);break;
+        case IDC_STARTUP:SetStartup(!startupHere);break;
+        case IDC_DISABLE_OLD:SetStartup(false);break;
+        case IDC_CHOOSE_FOLDER:ChooseFolder(settingsWindow);break;
+        case IDC_CHANGE_KEY:case IDC_HOTKEY_VALUE:
+            choosingHotkey=true;settingsStatus=Text(TextId::PressAKeyOrShortcutEGPrintScreenOrCtrlAltSEscCan);break;
+        default:return;
+        }
+        RefreshSettings();
     }
-    void PaintSettings(){
-        if(!active)return;Resources();target->BeginDraw();target->Clear(D2D1::ColorF(0x1c1c1c));
-        SetColor(brush.Get(),0x262626);target->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(28,24,76,72),12,12),brush.Get());Icon(ui::Icon::Settings,D2D1::RectF(39,35,65,61),0xdcdcd5);SetColor(brush.Get(),0xebebe8);const wchar_t* title=Text(TextId::Settings);target->DrawTextW(title,static_cast<UINT32>(wcslen(title)),settingsTitleFont.Get(),D2D1::RectF(92,22,614,58),brush.Get());Label(Text(TextId::SparkshotCaptureSavingAndStartup),D2D1::RectF(92,59,624,81),0xacaca8,true);Button(CloseButton());Icon(ui::Icon::Close,D2D1::RectF(644,20,660,36),0xebebe8);
-        SetColor(brush.Get(),0x3b3b3b);target->DrawLine(D2D1::Point2F(28,94),D2D1::Point2F(652,94),brush.Get(),1);
-        SettingsCard(D2D1::RectF(28,108,652,242),ui::Icon::Keyboard,Text(TextId::ScreenCapture2));Label(hotkeyAvailable?Text(TextId::ShortcutStartsAreaSelection):Text(TextId::ShortcutIsInUseChooseAnother),D2D1::RectF(98,156,632,178),hotkeyAvailable?0xacaca8:0xffc857,true);
-        const auto key=HotkeyValue();SetColor(brush.Get(),choosingHotkey?0x333333:0x1c1c1c);target->FillRoundedRectangle(D2D1::RoundedRect(key,7,7),brush.Get());SetColor(brush.Get(),choosingHotkey?0xdcdcd5:0x3b3b3b);target->DrawRoundedRectangle(D2D1::RoundedRect(key,7,7),brush.Get(),1);Icon(ui::Icon::Keyboard,D2D1::RectF(60,193,78,211),0xacaca8);Label(choosingHotkey?Text(TextId::PressANewShortcut):HotkeyName(),D2D1::RectF(91,192,492,218),0xebebe8,true);SettingsAction(HotkeySettingButton(),Text(TextId::Change),choosingHotkey);
-        SettingsCard(D2D1::RectF(28,258,652,396),ui::Icon::Folder,Text(TextId::Saving));Label(Text(TextId::ScreenshotFolderScreenshotNumberPng),D2D1::RectF(98,306,504,328),0xacaca8,true);SettingsAction(FolderSettingButton(),Text(TextId::Choose));SettingsPath(folder.wstring(),D2D1::RectF(48,338,632,378));
-        SettingsCard(D2D1::RectF(28,412,652,600),ui::Icon::Startup,Text(TextId::Startup));Label(startupHere?Text(TextId::OnLaunchThisCopyWhenYouSignInToWindows):startupCommand.empty()?Text(TextId::OffUseTheSwitchOnTheRight):Text(TextId::AnotherCopyTurnOnToReplaceItsPath),D2D1::RectF(98,460,634,484),0xacaca8,true);
-        const auto toggle=D2D1::RectF(584,438,632,464);SetColor(brush.Get(),startupHere?0xdcdcd5:Inside(StartupButton(),mouse)?0x555555:0x3b3b3b);target->FillRoundedRectangle(D2D1::RoundedRect(toggle,13,13),brush.Get());SetColor(brush.Get(),startupHere?0x1c1c1c:0xacaca8);target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(startupHere?619.0f:597.0f,451),9,9),brush.Get());
-        Label(Text(TextId::ApplicationLocation),D2D1::RectF(48,494,632,515),0xacaca8,true);SettingsPath(executable.wstring(),D2D1::RectF(48,518,632,554));
-        Label(!startupCommand.empty()&&!startupHere?Text(TextId::YouCanDisableTheOldEntry):Text(TextId::StartQuietlyInTheTrayWithoutCapturing),D2D1::RectF(48,565,!startupCommand.empty()&&!startupHere?484.0f:632.0f,590),0xacaca8,true);if(!startupCommand.empty()&&!startupHere)SettingsAction(StartupOffButton(),Text(TextId::Disable),false,false);
-        SettingsAction(LanguageButton(false),L"English",language==Language::English,false);SettingsAction(LanguageButton(true),L"Русский",language==Language::Russian,false);
-        if(!status.empty()){Icon(ui::Icon::Info,D2D1::RectF(28,620,48,640),0xffc857);Label(status,D2D1::RectF(62,614,652,658),0xffc857,true);}
-        PresentFrame(target->EndDraw());
+    bool DialogInput(MSG& msg){
+        if(!settingsWindow||!IsWindowVisible(settingsWindow)||
+            (msg.hwnd!=settingsWindow&&!IsChild(settingsWindow,msg.hwnd)))return false;
+        const bool keyDown=msg.message==WM_KEYDOWN||msg.message==WM_SYSKEYDOWN;
+        if(choosingHotkey&&(keyDown||(msg.message==WM_KEYUP&&msg.wParam==VK_SNAPSHOT))){
+            try{HotkeyInput(msg.wParam);}catch(const std::exception& error){SettingsError(error);}
+            return true;
+        }
+        if(keyDown&&msg.wParam==VK_F2){SendMessageW(settingsWindow,WM_COMMAND,IDC_CHOOSE_FOLDER,0);return true;}
+        if(keyDown&&msg.wParam==VK_RETURN&&msg.hwnd!=settingsWindow){
+            SendMessageW(msg.hwnd,BM_CLICK,0,0);return true;
+        }
+        return IsDialogMessageW(settingsWindow,&msg)!=FALSE;
     }
-    void PaintTray(){
-        Resources();target->BeginDraw();target->Clear(D2D1::ColorF(0x1c1c1c));Icon(ui::Icon::Spark,D2D1::RectF(16,15,40,39),0xebebe8);Label(L"Sparkshot",D2D1::RectF(51,15,250,45),0xebebe8,true);
-        const std::array<std::wstring,4> labels{FormatLocalized(Text(TextId::Capture),HotkeyName()),Text(TextId::Settings),Text(TextId::SaveFolder2),Text(TextId::Exit)};
-        for(int i=0;i<4;++i){const auto r=TrayRow(i);Button(r);Icon(i==0?ui::Icon::Rectangle:i==1?ui::Icon::Settings:i==2?ui::Icon::Folder:ui::Icon::Exit,D2D1::RectF(20,r.top+9,42,r.top+31));Label(labels[i],D2D1::RectF(56,r.top+11,263,r.bottom),0xebebe8,true);}
-        PresentFrame(target->EndDraw());
+    void SettingsError(const std::exception& error){
+        settingsStatus=ErrorText(error);RefreshSettings();
     }
+    static INT_PTR CALLBACK SettingsProc(HWND dlg,UINT message,WPARAM wp,LPARAM lp){
+        auto* self=reinterpret_cast<Impl*>(GetWindowLongPtrW(dlg,DWLP_USER));
+        if(message==WM_INITDIALOG){
+            self=reinterpret_cast<Impl*>(lp);SetWindowLongPtrW(dlg,DWLP_USER,lp);
+            self->settingsWindow=dlg;self->settingsView.SetFonts(dlg);return TRUE;
+        }
+        if(!self)return FALSE;
+        try{
+            switch(message){
+            case WM_PAINT:{
+                PAINTSTRUCT ps{};HDC dc=BeginPaint(dlg,&ps);
+                self->settingsView.Paint(dlg,dc,self->factory.Get(),!self->settingsStatus.empty());
+                EndPaint(dlg,&ps);return TRUE;
+            }
+            case WM_ERASEBKGND:return TRUE;
+            case WM_CTLCOLORSTATIC:return reinterpret_cast<INT_PTR>(self->settingsView.StaticColor(reinterpret_cast<HWND>(lp),reinterpret_cast<HDC>(wp)));
+            case WM_DRAWITEM:{
+                const auto& item=*reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+                const bool selected=(item.CtlID==IDC_STARTUP&&self->startupHere)||
+                    (item.CtlID==IDC_CHANGE_KEY&&self->choosingHotkey)||
+                    (item.CtlID==IDC_ENGLISH&&self->language==Language::English)||
+                    (item.CtlID==IDC_RUSSIAN&&self->language==Language::Russian);
+                self->settingsView.DrawButton(item,selected);return TRUE;
+            }
+            case WM_NCHITTEST:{
+                POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(dlg,&p);
+                RECT r{};GetClientRect(dlg,&r);
+                HWND hit=ChildWindowFromPointEx(dlg,p,CWP_SKIPINVISIBLE|CWP_SKIPDISABLED);
+                const int id=GetDlgCtrlID(hit);
+                if(PtInRect(&r,p)&&p.y<r.bottom*94/664&&id!=IDC_ENGLISH&&id!=IDC_RUSSIAN&&id!=IDCANCEL){
+                    SetWindowLongPtrW(dlg,DWLP_MSGRESULT,HTCAPTION);return TRUE;
+                }
+                break;
+            }
+            case WM_ACTIVATE:
+                if(LOWORD(wp)==WA_INACTIVE&&self->choosingHotkey){
+                    self->choosingHotkey=false;self->settingsStatus=self->Text(TextId::ShortcutSelectionCancelled);
+                    self->RefreshSettings();
+                }break;
+            case WM_COMMAND:
+                if(HIWORD(wp)==BN_CLICKED){self->SettingsAction(LOWORD(wp));return TRUE;}
+                break;
+            case WM_CLOSE:self->CloseSettings();return TRUE;
+            case WM_NCDESTROY:self->settingsWindow=nullptr;break;
+            }
+        }catch(const std::exception& error){self->SettingsError(error);return TRUE;}
+        return FALSE;
+    }
+
     static LRESULT CALLBACK Procedure(HWND hwnd,UINT message,WPARAM wparam,LPARAM lparam){
         auto* self=reinterpret_cast<Impl*>(GetWindowLongPtrW(hwnd,GWLP_USERDATA));
         if(message==WM_NCCREATE){self=static_cast<Impl*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);self->window=hwnd;SetWindowLongPtrW(hwnd,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(self));}
         if(!self)return DefWindowProcW(hwnd,message,wparam,lparam);
         try{
             switch(message){
-            case CaptureMessage:self->Capture();return 0;
+            case CaptureMessage:
+                if(wparam==1&&self->active&&!IsWindowVisible(self->settingsWindow)){
+                    if(!self->headless)SetForegroundWindow(hwnd);
+                }else self->Capture();
+                return 0;
             case FrameMessage:return 0;
+            case WM_COPY:if(self->active)self->Execute(EditorCommand::Copy,hwnd);return 0;
             // Кадр нужен только для изолированной проверки настоящего исполняемого файла.
             case ReviewFrameMessage:
                 if(self->headless&&self->active){
@@ -908,7 +1187,7 @@ struct App::Impl {
                     SaveScreenshot(self->base/L"test-output",EncodePng(frame));return 1;
                 }
                 return 0;
-            case WM_HOTKEY:if(self->settings&&self->choosingHotkey)self->HotkeyInput(self->captureKey);else self->Capture();return 0;
+            case WM_HOTKEY:if(self->choosingHotkey)self->HotkeyInput(self->captureKey);else self->Capture();return 0;
             case WM_PAINT:{PAINTSTRUCT paint{};BeginPaint(hwnd,&paint);EndPaint(hwnd,&paint);self->RequestFrame();return 0;}
             case WM_PRINT:
             case WM_PRINTCLIENT:{
@@ -918,29 +1197,39 @@ struct App::Impl {
                 return SetDIBitsToDevice(reinterpret_cast<HDC>(wparam),0,0,self->image.width,self->image.height,0,0,0,self->image.height,pixels.data(),&info,DIB_RGB_COLORS);
             }
             case WM_ERASEBKGND:return 1;
-            case WM_LBUTTONDOWN:{const auto point=D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam)));if(self->settings)self->SettingsDown(point);else if(self->trayMenu){for(int row=0;row<4;++row)if(Inside(self->TrayRow(row),point)){if(row==0)self->Capture();else if(row==1)self->ShowSettings();else if(row==2){self->ShowSettings();self->ChooseFolder();}else DestroyWindow(hwnd);break;}}else self->Down(point);self->RefreshCursor();return 0;}
-            case WM_MOUSEMOVE:if(!self->mouseInside){self->mouseInside=true;TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,hwnd,0};if(!self->headless)TrackMouseEvent(&tracking);}if(self->trayMenu||self->settings){self->mouse=D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam)));self->RequestFrame();}else self->Move(D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam))));self->RefreshCursor();return 0;
+            case WM_CAPTURECHANGED:self->CancelPointerInteraction();return 0;
+            case WM_CANCELMODE:self->CancelPointerInteraction();break;
+            case WM_LBUTTONDOWN:{
+                self->Down(D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam))));
+                self->RefreshCursor();return 0;
+            }
+            case WM_MOUSEMOVE:
+                if(!self->mouseInside){
+                    self->mouseInside=true;TRACKMOUSEEVENT tracking{sizeof(tracking),TME_LEAVE,hwnd,0};
+                    if(!self->headless)TrackMouseEvent(&tracking);
+                }
+                self->Move(D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam))));
+                self->RefreshCursor();return 0;
             case WM_MOUSELEAVE:self->mouseInside=false;self->hover=-1;self->RequestFrame();return 0;
             case WM_SETCURSOR:if(LOWORD(lparam)==HTCLIENT){if(reinterpret_cast<HWND>(wparam)!=hwnd)return FALSE;self->RefreshCursor(true);return TRUE;}break;
             case WM_LBUTTONUP:self->Up(D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam))));self->RefreshCursor();return 0;
-            case WM_KEYDOWN:if(self->settings&&self->choosingHotkey)self->HotkeyInput(wparam);else{self->Modifier(wparam,true);self->Key(wparam);}self->RefreshCursor();return 0;
-            case WM_KEYUP:if(self->settings&&self->choosingHotkey&&wparam==VK_SNAPSHOT)self->HotkeyInput(wparam);else self->Modifier(wparam,false);return 0;
-            case WM_RBUTTONUP:if(self->active&&!self->trayMenu&&!self->settings&&!self->dragging&&self->selected){self->mouse=D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam)));if(!self->palette)self->OpenPalette(self->mouse);}self->RefreshCursor();return 0;
+            case WM_KEYDOWN:self->Modifier(wparam,true);self->Key(wparam);self->RefreshCursor();return 0;
+            case WM_KEYUP:self->Modifier(wparam,false);return 0;
+            case WM_RBUTTONUP:if(self->active&&!self->dragging&&self->selected){self->mouse=D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lparam)),static_cast<float>(GET_Y_LPARAM(lparam)));if(!self->palette)self->OpenPalette(self->mouse);}self->RefreshCursor();return 0;
             case WM_CONTEXTMENU:return 0;
             case WM_COMMAND:if(reinterpret_cast<HWND>(lparam)==self->hexEdit&&HIWORD(wparam)==EN_CHANGE)self->ReadHex();else if(reinterpret_cast<HWND>(lparam)==self->edit&&HIWORD(wparam)==EN_CHANGE)self->ReadText();return 0;
             case WM_TIMER:if(wparam==1&&self->edit){self->caretVisible=!self->caretVisible;self->RequestFrame();}return 0;
             case WM_CTLCOLOREDIT:{const HDC dc=reinterpret_cast<HDC>(wparam);SetTextColor(dc,RGB(235,235,232));SetBkColor(dc,RGB(38,38,38));return reinterpret_cast<LRESULT>(self->inputBackground);}
-            case WM_ACTIVATE:if(LOWORD(wparam)==WA_INACTIVE){self->picker=false;self->snapShapes=false;self->guides=false;if(self->choosingHotkey){self->choosingHotkey=false;self->status=self->Text(TextId::ShortcutSelectionCancelled);}self->RequestFrame();}else if(self->active){self->snapShapes=(GetKeyState(VK_SHIFT)&0x8000)!=0;self->guides=(GetKeyState(VK_TAB)&0x8000)!=0;self->RefreshCursor(true);self->RequestFrame();}break;
-            case WM_SYSKEYDOWN:if(self->settings&&self->choosingHotkey){self->HotkeyInput(wparam);return 0;}if(wparam==VK_MENU||wparam==VK_SHIFT||wparam==VK_TAB){self->Modifier(wparam,true);return 0;}break;
+            case WM_ACTIVATE:if(LOWORD(wparam)==WA_INACTIVE){self->picker=false;self->snapShapes=false;self->guides=false;self->RequestFrame();}else if(self->active){self->snapShapes=(GetKeyState(VK_SHIFT)&0x8000)!=0;self->guides=(GetKeyState(VK_TAB)&0x8000)!=0;self->RefreshCursor(true);self->RequestFrame();}break;
+            case WM_SYSKEYDOWN:if(wparam==VK_MENU||wparam==VK_SHIFT||wparam==VK_TAB){self->Modifier(wparam,true);return 0;}break;
             case WM_SYSKEYUP:if(wparam==VK_MENU||wparam==VK_SHIFT||wparam==VK_TAB){self->Modifier(wparam,false);return 0;}break;
             case WM_MOUSEWHEEL:self->Wheel(GET_WHEEL_DELTA_WPARAM(wparam),GET_KEYSTATE_WPARAM(wparam));self->RefreshCursor();return 0;
             case WM_SIZE:if(self->target){RECT bounds{};GetClientRect(hwnd,&bounds);const auto size=self->target->GetPixelSize();if(size.width!=static_cast<UINT>(bounds.right)||size.height!=static_cast<UINT>(bounds.bottom)){self->DropRenderResources();self->RequestFrame();}}return 0;
-            case WM_NCHITTEST:if(self->settings){POINT point{GET_X_LPARAM(lparam),GET_Y_LPARAM(lparam)};ScreenToClient(hwnd,&point);const auto local=D2D1::Point2F(static_cast<float>(point.x),static_cast<float>(point.y));if(Inside(self->LanguageButton(false),local)||Inside(self->LanguageButton(true),local))return HTCLIENT;if(point.y>=0&&point.y<94&&point.x>=0&&point.x<self->image.width-52)return HTCAPTION;}break;
-            case WM_CLOSE:if(self->demo)DestroyWindow(hwnd);else if(self->settings||self->trayMenu)self->Hide();else self->FinishCapture();return 0;
+            case WM_CLOSE:if(self->demo)DestroyWindow(hwnd);else self->FinishCapture();return 0;
             case TrayMessage:
                 if(lparam==WM_LBUTTONDBLCLK)self->Capture();
                 else if(lparam==WM_RBUTTONUP)self->ShowTrayMenu();return 0;
-            case WM_DESTROY:{UnregisterHotKey(hwnd,1);NOTIFYICONDATAW icon{sizeof(icon)};icon.hWnd=hwnd;icon.uID=1;Shell_NotifyIconW(NIM_DELETE,&icon);PostQuitMessage(0);return 0;}
+            case WM_DESTROY:{if(self->settingsWindow)DestroyWindow(self->settingsWindow);UnregisterHotKey(hwnd,1);NOTIFYICONDATAW icon{sizeof(icon)};icon.hWnd=hwnd;icon.uID=1;Shell_NotifyIconW(NIM_DELETE,&icon);PostQuitMessage(0);return 0;}
             }
         }catch(const std::exception& error){self->Error(error);}
         return DefWindowProcW(hwnd,message,wparam,lparam);
@@ -952,27 +1241,41 @@ App::~App()=default;
 int App::Run(){
     impl_->demo=impl_->command.find(L"--demo")!=std::wstring::npos;impl_->headless=impl_->demo&&impl_->command.find(L"--headless")!=std::wstring::npos;
     const bool autostart=impl_->command.find(L"--autostart")!=std::wstring::npos;
-    if(!impl_->demo){const HWND existing=FindWindowW(L"Sparkshot.Native",nullptr);if(existing){if(!autostart)PostMessageW(existing,CaptureMessage,0,0);return 0;}}
+    StartupGate startupGate;
+    if(!impl_->demo){
+        if(!startupGate.Lock())return 3;
+        if(const HWND existing=FindWindowW(L"Sparkshot.Native",nullptr)){
+            if(!autostart){
+                DWORD pid{};GetWindowThreadProcessId(existing,&pid);AllowSetForegroundWindow(pid);
+                return PostMessageW(existing,CaptureMessage,1,0)?0:3;
+            }
+            return 0;
+        }
+    }
     impl_->language=ChooseLanguage(L"",PRIMARYLANGID(GetUserDefaultUILanguage())==LANG_RUSSIAN?L"ru":L"en");
     try{impl_->LoadLanguage();impl_->LoadSettings();}
-    catch(const std::exception& error){impl_->Error(error);if(!impl_->headless)MessageBoxW(nullptr,impl_->status.c_str(),L"Sparkshot",MB_OK|MB_ICONERROR);return 1;}
+    catch(const std::exception& error){startupGate.Close();impl_->Error(error);if(!impl_->headless)MessageBoxW(nullptr,impl_->status.c_str(),L"Sparkshot",MB_OK|MB_ICONERROR);return 1;}
     impl_->inputFont=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     if(FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,impl_->factory.GetAddressOf())))return 2;
     // Однократная инициализация при запуске: клавиша захвата не пересоздаёт графическое устройство.
-    try{impl_->renderer.Initialize(impl_->factory.Get(),impl_->headless&&impl_->command.find(L"--warp")!=std::wstring::npos);}catch(const std::exception& error){impl_->Error(error);if(!impl_->headless)MessageBoxW(nullptr,impl_->status.c_str(),L"Sparkshot",MB_OK|MB_ICONERROR);return 2;}
+    try{impl_->renderer.Initialize(impl_->factory.Get(),impl_->headless&&impl_->command.find(L"--warp")!=std::wstring::npos);}catch(const std::exception& error){startupGate.Close();impl_->Error(error);if(!impl_->headless)MessageBoxW(nullptr,impl_->status.c_str(),L"Sparkshot",MB_OK|MB_ICONERROR);return 2;}
     impl_->factory->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,D2D1_LINE_JOIN_ROUND),nullptr,0,&impl_->lineStyle);
     if(FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(impl_->textFactory.GetAddressOf()))))return 2;
     impl_->textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_SEMI_BOLD,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,21,L"ru-ru",&impl_->font);
     impl_->textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,14,L"ru-ru",&impl_->smallFont);
-    impl_->textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_SEMI_BOLD,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,26,L"ru-ru",&impl_->settingsTitleFont);
-    impl_->textFactory->CreateTextFormat(L"Segoe UI",nullptr,DWRITE_FONT_WEIGHT_SEMI_BOLD,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,17,L"ru-ru",&impl_->settingsSectionFont);
     WNDCLASSW type{};type.hInstance=impl_->instance;type.lpfnWndProc=Impl::Procedure;type.lpszClassName=L"Sparkshot.Native";type.hCursor=impl_->cursors.Arrow();type.hIcon=LoadIconW(impl_->instance,MAKEINTRESOURCEW(101));RegisterClassW(&type);
     const HWND window=CreateWindowExW(WS_EX_APPWINDOW,type.lpszClassName,L"Sparkshot",WS_POPUP|WS_CLIPCHILDREN,0,0,100,100,nullptr,nullptr,impl_->instance,impl_.get());if(!window)return 3;
-    NOTIFYICONDATAW icon{sizeof(icon)};icon.hWnd=window;icon.uID=1;icon.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP;icon.uCallbackMessage=TrayMessage;icon.hIcon=type.hIcon;wcscpy_s(icon.szTip,L"Sparkshot — Ctrl+Alt+S");if(!impl_->headless)Shell_NotifyIconW(NIM_ADD,&icon);
-    if(!impl_->demo)impl_->hotkeyAvailable=RegisterHotKey(window,1,impl_->captureModifiers|MOD_NOREPEAT,impl_->captureKey)!=FALSE;impl_->UpdateTrayTip();
-    if(!autostart)PostMessageW(window,CaptureMessage,0,0);MSG message{};
+    if(!impl_->demo)impl_->hotkeyAvailable=RegisterHotKey(window,1,impl_->captureModifiers|MOD_NOREPEAT,impl_->captureKey)!=FALSE;
+    if(!impl_->headless){
+        NOTIFYICONDATAW icon{sizeof(icon)};icon.hWnd=window;icon.uID=1;icon.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP;
+        icon.uCallbackMessage=TrayMessage;icon.hIcon=type.hIcon;
+        const auto tip=L"Sparkshot — "+impl_->HotkeyName();wcsncpy_s(icon.szTip,tip.c_str(),_TRUNCATE);
+        Shell_NotifyIconW(NIM_ADD,&icon);
+    }
+    if(!autostart)PostMessageW(window,CaptureMessage,0,0);
+    startupGate.Close();MSG message{};
     bool quit=false;
-    const auto dispatch=[&](MSG& next){if(next.message==WM_QUIT){message=next;quit=true;return;}TranslateMessage(&next);DispatchMessageW(&next);};
+    const auto dispatch=[&](MSG& next){if(next.message==WM_QUIT){message=next;quit=true;return;}if(impl_->DialogInput(next))return;TranslateMessage(&next);DispatchMessageW(&next);};
     while(!quit){
         if(impl_->active&&impl_->framePending){
             try{impl_->Resources();}catch(const std::exception& error){impl_->DropRenderResources(true);impl_->Error(error);impl_->framePending=false;continue;}

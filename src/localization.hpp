@@ -95,9 +95,10 @@ enum class TextId : unsigned {
     ErrorCouldNotReadThePng = 1083,
     ErrorNotEnoughMemoryForTheClipboard = 1084,
     ErrorTheClipboardIsInUseByAnotherApplication = 1085,
-    ErrorCouldNotCopyTheImage = 1086
+    ErrorCouldNotCopyTheImage = 1086,
+    Close = 1087
 };
-inline constexpr size_t TextCount = 87;
+inline constexpr size_t TextCount = 88;
 std::wstring LoadLocalizedString(HINSTANCE instance, Language language, TextId id);
 std::wstring FormatLocalized(std::wstring_view pattern, std::wstring_view value);
 class LocalizedError : public std::runtime_error {

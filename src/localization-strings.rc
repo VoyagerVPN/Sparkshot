@@ -89,6 +89,7 @@ BEGIN
     1084 "Not enough memory for the clipboard"
     1085 "The clipboard is in use by another application"
     1086 "Could not copy the image"
+    1087 "Close"
 END
 LANGUAGE LANG_RUSSIAN, SUBLANG_DEFAULT
 STRINGTABLE
@@ -180,4 +181,5 @@ BEGIN
     1084 "Недостаточно памяти для буфера обмена"
     1085 "Буфер обмена занят другим приложением"
     1086 "Не удалось скопировать изображение"
+    1087 "Закрыть"
 END

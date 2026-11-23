@@ -27,7 +27,7 @@ Image CaptureDesktop() {
     void* bits{};
     const HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ previous = bitmap ? SelectObject(memory, bitmap) : nullptr;
-    const bool ok = bits && BitBlt(memory, 0, 0, image.width, image.height, screen, image.x, image.y, SRCCOPY | CAPTUREBLT);
+    const bool ok = previous && bits && BitBlt(memory, 0, 0, image.width, image.height, screen, image.x, image.y, SRCCOPY | CAPTUREBLT) && GdiFlush();
     if (ok) {
         const auto* pixels = static_cast<std::uint32_t*>(bits);
         image.pixels.assign(pixels, pixels + static_cast<size_t>(image.width) * image.height);
@@ -114,7 +114,8 @@ void CopyImage(const Image& image, HWND owner) {
             const HGLOBAL block = pass ? dibBlock : v5Block;
             auto* target = static_cast<std::uint8_t*>(GlobalLock(block));
             if (!target) { allocated = false; break; }
-            std::memcpy(target, &header, pass ? sizeof(BITMAPINFOHEADER) : sizeof(BITMAPV5HEADER));
+            header.bV5Size = pass ? sizeof(BITMAPINFOHEADER) : sizeof(BITMAPV5HEADER);
+            std::memcpy(target, &header, header.bV5Size);
             auto* pixels = reinterpret_cast<std::uint32_t*>(target + (pass ? sizeof(BITMAPINFOHEADER) : sizeof(BITMAPV5HEADER)));
             for (int y = 0; y < image.height; ++y)
                 std::memcpy(pixels + static_cast<size_t>(image.height - 1 - y) * image.width, image.pixels.data() + static_cast<size_t>(y) * image.width, static_cast<size_t>(image.width) * 4);
